@@ -2486,8 +2486,6 @@ def start_watchdog_daemon(job_pids, sysVars, mail_config=None):
 
     return proc.pid
 
-ERPNEXT_URL = os.environ.get("CCD_ERPNEXT_URL", "").strip().rstrip("/")
-
 import keyring as _keyring
 def _safe_get_keyring_password(service, username, default=""):
     try:
@@ -2504,6 +2502,10 @@ def _safe_set_keyring_password(service, username, password):
         print(f"WARNING: Could not store keyring secret {service}/{username}: {e}")
         return False
 
+ERPNEXT_URL = (
+    os.environ.get("CCD_ERPNEXT_URL", "")
+    or _safe_get_keyring_password("ccd_agent", "erpnext_url", "")
+).strip().rstrip("/")
 ERPNEXT_USER = _safe_get_keyring_password(
     "ccd_agent", "erpnext_user", os.environ.get("CCD_ERPNEXT_USER", "")
 )
@@ -2513,15 +2515,22 @@ if not ERPNEXT_URL:
 if not ERPNEXT_USER:
     print("WARNING: ERPNext username not found in the keyring or CCD_ERPNEXT_USER.")
 if not ERPNEXT_PASS:
-    print("WARNING: ERPNext password not found in Windows Credential Manager.")
-    print("         Run the setup bat file again to store credentials.")
+    print("WARNING: ERPNext password not found in the operating-system credential store.")
+    print("         Run configure_agent.py or the platform setup script.")
 
 # Deployment names are supplied at runtime rather than embedded in source.
-CCD_SITE_NAME = os.environ.get("CCD_SITE_NAME", "frontend").strip() or "frontend"
-NAMESPACE = os.environ.get("CCD_SOCKET_NAMESPACE", f"/{CCD_SITE_NAME}").strip()
+CCD_SITE_NAME = (
+    os.environ.get("CCD_SITE_NAME", "")
+    or _safe_get_keyring_password("ccd_agent", "site_name", "frontend")
+).strip() or "frontend"
+NAMESPACE = (
+    os.environ.get("CCD_SOCKET_NAMESPACE", "")
+    or _safe_get_keyring_password(
+        "ccd_agent", "socket_namespace", f"/{CCD_SITE_NAME}"
+    )
+).strip()
 
 http_session = requests.Session()
-#http_session.verify = r'/etc/ssl/certs/hksr.org.hk.pem'
 http_session.verify = True
 
 def login_to_erpnext():

@@ -7,5 +7,6 @@ daemon_logs/
 .env
 .venv/
 venv/
+Run_Agent.bat
 site_config*.json
 private/

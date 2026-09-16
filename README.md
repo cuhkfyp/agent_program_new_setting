@@ -30,6 +30,9 @@ Manager changes that registration to `Fast Bulk Insert`.
 
 - `agent/agent_program.py` — sanitized cross-platform agent with central
   coordination and a legacy fallback.
+- `agent/setup_windows.bat` and `agent/configure_agent.py` — client setup that
+  stores endpoint/account values in the OS credential store without embedding
+  them in source or generated launchers.
 - `server/api_agent_sync.py` — authenticated lease, bulk insert, state, and
   post-processing API.
 - `server/agent_sync_setup.py` — idempotent DocType/custom-field installer.
@@ -62,7 +65,15 @@ promote more registrations until both ingestion and post-processing finish.
 ## Agent configuration
 
 No deployment URL, username, password, cookie, or client database credential is
-stored in this repository. Configure the endpoint and account at runtime:
+stored in this repository. On Windows, run:
+
+```text
+agent\setup_windows.bat
+```
+
+The setup installs dependencies, prompts for deployment values, saves them in
+Windows Credential Manager, and creates `Run_Agent.bat`. Alternatively,
+configure the endpoint/account through environment variables:
 
 ```text
 CCD_ERPNEXT_URL=https://erp.example.org
@@ -70,9 +81,10 @@ CCD_ERPNEXT_USER=ccd-agent@example.org
 CCD_SITE_NAME=frontend
 ```
 
-Store `erpnext_pass` in the OS keyring under service `ccd_agent`. Client database
-passwords are still retrieved through the existing authorized ERPNext method
-and are never printed by this version.
+`configure_agent.py` stores `erpnext_url`, `erpnext_user`, `erpnext_pass`, site,
+and Socket.IO namespace in the OS keyring under service `ccd_agent`. Client
+database passwords are still retrieved through the existing authorized ERPNext
+method and are never printed by this version.
 
 ## Compatibility and rollback
 

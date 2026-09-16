@@ -1,0 +1,8 @@
+keyring
+mysql-connector-python
+oracledb
+pyodbc
+python-socketio[client]
+requests
+truststore
+urllib3
