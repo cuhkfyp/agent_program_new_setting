@@ -35,6 +35,21 @@ development defaults, not universal production values.
 9. Increase global capacity or enable another source only after the canary is
    clean.
 
+## Client agent cutover
+
+Stop the old parent process, watchdog, and detached job daemon before starting
+the new agent. Install the new files in the same agent directory if the intent
+is to reuse the existing `daemon_logs/*_delta_cache.json` checkpoints. Starting
+from a new empty directory intentionally causes a full source resynchronization.
+
+Run `agent/setup_windows.bat` once to install dependencies and store the URL,
+integration account, site, and Socket.IO namespace in Windows Credential
+Manager. Then start `Run_Agent.bat`. Confirm the log shows the governed stable
+source ID and central configuration before forcing a full-sync benchmark.
+
+Do not delete a delta cache merely to test connectivity: cache deletion clears
+and rebuilds that source in CCD Master.
+
 ## Deployment command
 
 ```bash
