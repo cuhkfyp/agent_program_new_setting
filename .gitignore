@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.log
+daemon_logs/
+*.delta_cache.json
+*.full_sync_pending
+.env
+.venv/
+venv/
+site_config*.json
+private/

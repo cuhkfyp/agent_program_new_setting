@@ -1,0 +1,86 @@
+# CCD Agent Central Sync
+
+This repository contains an opt-in CCD Master ingestion path for the existing
+database agent. It solves two separate problems without changing the current
+`agent_bulk_sync` Server Script or existing Frappe hooks:
+
+- agents on different computers coordinate through a central Redis lease;
+- new CCD Master rows use one validated SQL bulk insert per batch instead of a
+  `Document.insert()` call for every row.
+
+Existing registrations remain on `Legacy Document Insert` until a System
+Manager changes that registration to `Fast Bulk Insert`.
+
+## Important behavior
+
+- A physical host and a source database are different identities. A host may
+  run any number of submitted CCD Registration records/databases.
+- Source identity is resolved in this order: `Agent Sync Source ID`, governed
+  `Stable CCD Source Key`, complete CCD Registration name. Numeric suffixes are
+  never blindly removed.
+- The agent computes its delta before requesting capacity. A zero-change run
+  does not take a global slot.
+- The global slot is released when ingestion finishes. A per-source lease stays
+  active while identity and portal work runs on the long queue, preventing a
+  second mutation of the same source.
+- Fast mode is limited to CCD Master's current static format naming rule. An
+  unsupported naming rule fails closed and must use legacy mode.
+
+## Repository layout
+
+- `agent/agent_program.py` — sanitized cross-platform agent with central
+  coordination and a legacy fallback.
+- `server/api_agent_sync.py` — authenticated lease, bulk insert, state, and
+  post-processing API.
+- `server/agent_sync_setup.py` — idempotent DocType/custom-field installer.
+- `deployment/install_runtime.sh` — parameterized Docker deployment for all
+  Frappe runtime containers.
+- `tests/` — transactional and queue-handoff smoke tests.
+- `docs/ARCHITECTURE.md` and `docs/OPERATIONS.md` — design and rollout details.
+
+## Development installation
+
+```bash
+./deployment/install_runtime.sh --site frontend --prefix frappe_docker
+```
+
+The installer creates `CCD Agent Sync Settings` and an `Agent Sync` tab on
+`CCD Registration`. It deliberately leaves the global switch unchanged.
+
+In Desk:
+
+1. Open **CCD Agent Sync Settings**.
+2. Enable **Central Agent Sync** and **Central Coordination**.
+3. Set global capacity and batch sizes for the environment.
+4. Open one CCD Registration and verify **Agent Sync Source ID** against its
+   existing `ccd_reg_source` values.
+5. Change only that registration to **Fast Bulk Insert**.
+
+Run a full sync for one canary database and watch its Agent Sync tab. Do not
+promote more registrations until both ingestion and post-processing finish.
+
+## Agent configuration
+
+No deployment URL, username, password, cookie, or client database credential is
+stored in this repository. Configure the endpoint and account at runtime:
+
+```text
+CCD_ERPNEXT_URL=https://erp.example.org
+CCD_ERPNEXT_USER=ccd-agent@example.org
+CCD_SITE_NAME=frontend
+```
+
+Store `erpnext_pass` in the OS keyring under service `ccd_agent`. Client database
+passwords are still retrieved through the existing authorized ERPNext method
+and are never printed by this version.
+
+## Compatibility and rollback
+
+Fast mode is per registration. To roll back a source, change **CCD Master Sync
+Mode** to `Legacy Document Insert`; the agent uses the existing Server Script
+route on its next changed run. Disabling **Central Agent Sync** globally also
+returns every registration to legacy compatibility mode.
+
+The new server files have unique names and require no `hooks.py` edit. The
+installer only owns fields prefixed `agent_sync_` plus the dedicated settings
+DocType and index.
