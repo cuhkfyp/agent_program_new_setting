@@ -45,6 +45,60 @@ class StaticContracts(unittest.TestCase):
         self.assertIn('"agent_sync_run_id"', source)
         self.assertIn("_require_lease", source)
 
+    def test_generated_daemon_source_compiles(self) -> None:
+        tree = ast.parse(AGENT.read_text(encoding="utf-8"))
+        builder = next(
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "build_job_daemon_script"
+        )
+        namespace: dict[str, object] = {}
+        exec(
+            compile(
+                ast.Module(body=[builder], type_ignores=[]),
+                str(AGENT),
+                "exec",
+            ),
+            namespace,
+        )
+        script = namespace["build_job_daemon_script"](
+            job_name="JOB01",
+            task_name="contract-test",
+            actions=["SYNC_TO_CCD_MASTER_BULK"],
+            interval_seconds=60,
+            log_file="agent-test.log",
+            registration_id="REG-2",
+            source_id="HOST-DB",
+            physical_hostname="HOST",
+        )
+        compile(script, "<generated-daemon>", "exec")
+
+    def test_master_sync_never_invokes_automatic_clear_or_delete(self) -> None:
+        source = AGENT.read_text(encoding="utf-8")
+        start = source.index("# ---- SYNC_TO_CCD_MASTER_BULK macro ----")
+        end = source.index("# ---- SQL statements ----", start)
+        master_sync = source[start:end]
+        self.assertNotIn('"action": "clear"', master_sync)
+        self.assertNotIn('"action": "delete_by_source_keys"', master_sync)
+        self.assertNotIn('sess, "DELETE"', master_sync)
+        self.assertIn("inspect_master_source_state", master_sync)
+        self.assertIn("Reconciliation Required", master_sync)
+
+    def test_retirement_service_is_not_coupled_to_sync_api(self) -> None:
+        source = API.read_text(encoding="utf-8")
+        self.assertNotIn("api_identity_retirement", source)
+        self.assertIn("An active submitted CCD Registration is required", source)
+        self.assertIn("inspect_master_source_state", source)
+        self.assertIn("report_reconciliation_required", source)
+
+    def test_master_cache_is_scoped_to_registration_revision(self) -> None:
+        source = AGENT.read_text(encoding="utf-8")
+        self.assertIn('"version": 2', source)
+        self.assertIn('"registration_id": registration_id', source)
+        self.assertIn('"sync_generation": _hashlib.sha256', source)
+        self.assertIn("_cache_scope_mismatch", source)
+
     def test_no_hardcoded_erp_endpoint_or_password(self) -> None:
         tree = ast.parse(AGENT.read_text(encoding="utf-8"))
         text_values = {

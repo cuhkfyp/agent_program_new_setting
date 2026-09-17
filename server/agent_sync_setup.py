@@ -204,7 +204,7 @@ def _custom_fields() -> dict[str, list[dict[str, Any]]]:
                 "label": "Sync State",
                 "options": (
                     "Idle\nWaiting\nIngesting\nPost-processing\nSucceeded\n"
-                    "Completed with errors\nFailed"
+                    "Completed with errors\nReconciliation Required\nFailed"
                 ),
                 "default": "Idle",
                 "read_only": 1,

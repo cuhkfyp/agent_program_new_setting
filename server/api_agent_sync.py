@@ -27,6 +27,25 @@ LEGACY_MODE = "Legacy Document Insert"
 ACTIVE_STATES = {"Waiting", "Ingesting", "Post-processing"}
 ALLOWED_QUEUES = {"short", "default", "long"}
 STATIC_FORMAT_RE = re.compile(r"^format:([^{}]*)\{(#+)\}([^{}]*)$")
+RECONCILIATION_REASONS = {
+    "cache_missing_source_populated": (
+        "Local CCD Master cache is missing, but this source already has Master "
+        "rows. Automatic clearing is disabled; operator reconciliation is required."
+    ),
+    "cache_scope_mismatch_source_populated": (
+        "Local CCD Master cache belongs to another registration revision, but this "
+        "source still has Master rows. Operator reconciliation is required."
+    ),
+    "source_deletions_detected": (
+        "The client database no longer contains one or more cached Master source "
+        "keys. Automatic Master deletion is disabled; use the governed identity "
+        "retirement workflow or reconcile the source explicitly."
+    ),
+    "safe_bootstrap_unavailable": (
+        "A safe empty-source bootstrap could not be verified through central "
+        "coordination. No CCD Master rows were changed."
+    ),
+}
 
 ACQUIRE_LUA = """
 local source_key = KEYS[1]
@@ -116,7 +135,13 @@ def _settings() -> Any:
 def _registration(registration: str) -> Any:
     if not registration or not frappe.db.exists(REGISTRATION_DOCTYPE, registration):
         frappe.throw("A valid CCD Registration is required", frappe.DoesNotExistError)
-    return frappe.get_doc(REGISTRATION_DOCTYPE, registration)
+    doc = frappe.get_doc(REGISTRATION_DOCTYPE, registration)
+    if cint(doc.docstatus) != 1:
+        frappe.throw(
+            "An active submitted CCD Registration is required",
+            frappe.PermissionError,
+        )
+    return doc
 
 
 def _effective_source(registration_doc: Any) -> str:
@@ -142,6 +167,12 @@ def _validate_source(registration_doc: Any, source_id: str) -> str:
 
 def _source_digest(source_id: str) -> str:
     return hashlib.sha256(source_id.encode("utf-8")).hexdigest()
+
+
+def _sync_generation(registration_doc: Any, source_id: str) -> str:
+    """Identify one registration revision without changing governed source identity."""
+    material = f"{source_id}\x1f{registration_doc.name}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def _lease_keys(source_id: str) -> tuple[bytes, bytes]:
@@ -238,7 +269,9 @@ def get_sync_config(
     config.update(
         {
             "registration": doc.name,
+            "amended_from": str(doc.get("amended_from") or ""),
             "source_id": source,
+            "sync_generation": _sync_generation(doc, source),
             "physical_hostname": str(physical_hostname or ""),
             "database_name": str(database_name or ""),
         }
@@ -318,6 +351,33 @@ def acquire_sync_lease(
 
 
 @frappe.whitelist(methods=["POST"])
+def inspect_master_source_state(
+    registration: str,
+    source_id: str,
+    lease_token: str,
+    run_id: str,
+) -> dict[str, Any]:
+    """Read the source state while its central lease prevents bootstrap races."""
+    _require_writer()
+    doc = _registration(registration)
+    source = _validate_source(doc, source_id)
+    _require_lease(source, str(lease_token or ""))
+    active_run_id = str(doc.get("agent_sync_run_id") or "")
+    if active_run_id and active_run_id != str(run_id or ""):
+        frappe.throw("run_id does not match the active sync", frappe.PermissionError)
+    has_master_rows = bool(
+        frappe.db.exists(MASTER_DOCTYPE, {"ccd_reg_source": source})
+    )
+    return {
+        "registration": doc.name,
+        "source_id": source,
+        "sync_generation": _sync_generation(doc, source),
+        "master_has_rows": has_master_rows,
+        "source_state": "Populated" if has_master_rows else "Empty",
+    }
+
+
+@frappe.whitelist(methods=["POST"])
 def heartbeat_sync_lease(
     registration: str, source_id: str, lease_token: str, run_id: str
 ) -> dict[str, Any]:
@@ -375,13 +435,19 @@ def release_sync_lease(
         )
     )
     if released:
+        error_text = str(error or "")[:1000]
+        final_state = (
+            "Reconciliation Required"
+            if error_text.startswith("Reconciliation Required")
+            else ("Failed" if error_text else "Idle")
+        )
         _set_state(
             doc.name,
-            agent_sync_state="Failed" if error else "Idle",
+            agent_sync_state=final_state,
             agent_sync_run_id=str(run_id or ""),
             agent_sync_heartbeat_at=now_datetime(),
             agent_sync_finished_at=now_datetime(),
-            agent_sync_last_error=str(error or "")[:1000] or None,
+            agent_sync_last_error=error_text or None,
         )
     return {"released": released}
 
@@ -447,6 +513,37 @@ def report_no_changes(
         agent_sync_last_result="No CCD Master changes detected; no capacity slot used",
     )
     return {"state": "Succeeded", "changed": 0}
+
+
+@frappe.whitelist(methods=["POST"])
+def report_reconciliation_required(
+    registration: str,
+    source_id: str,
+    reason_code: str,
+    physical_hostname: str = "",
+    database_name: str = "",
+) -> dict[str, Any]:
+    """Expose a fail-closed agent decision without mutating CCD Master rows."""
+    _require_writer()
+    doc = _registration(registration)
+    _validate_source(doc, source_id)
+    code = str(reason_code or "").strip()
+    if code not in RECONCILIATION_REASONS:
+        frappe.throw("Unknown reconciliation reason", frappe.ValidationError)
+    message = RECONCILIATION_REASONS[code]
+    _set_state(
+        doc.name,
+        agent_sync_state="Reconciliation Required",
+        agent_sync_active_host=str(physical_hostname or ""),
+        agent_sync_active_database=str(database_name or ""),
+        agent_sync_heartbeat_at=now_datetime(),
+        agent_sync_finished_at=now_datetime(),
+        agent_sync_last_error=message[:1000],
+        agent_sync_last_result=(
+            f"No automatic CCD Master deletion or clearing was performed ({code})"
+        )[:2000],
+    )
+    return {"state": "Reconciliation Required", "reason_code": code}
 
 
 def _json_list(value: Any, label: str) -> list[Any]:

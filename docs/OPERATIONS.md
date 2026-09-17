@@ -52,6 +52,37 @@ Confirm the log shows the governed stable source ID and central configuration.
 Do not delete a delta cache merely to test connectivity. Cache absence is not
 authorization to delete, retire, or rebuild an existing CCD Master source.
 
+## Governed clear-and-reinsert test
+
+Use `SYNC_TO_CCD_MASTER_BULK` for this test; the legacy macro intentionally
+refuses to bootstrap a missing cache because it cannot prove an empty target
+under a central lease.
+
+1. Deploy the server modules and enable central synchronization and central
+   coordination. Keep the selected registration in `Fast Bulk Insert` mode.
+2. Install and run the new agent once against the still-active registration.
+   This upgrades an existing version-1 delta cache to the registration-scoped
+   version-2 format. This migration is recommended but not required for an
+   amended registration.
+3. Stop that source's agent/job daemon.
+4. In Desk, run **Actions → Cancel with Identity Retirement** and complete its
+   fingerprint and reason confirmation. Do not replace this with an agent API
+   call or manual SQL deletion.
+5. Amend the cancelled registration, submit the amended document, and retain
+   the governed stable source key. The amended document name is the new
+   registration revision.
+6. Reconfigure/reinstall that client so its `registration_id` is the submitted
+   amended document name, then start the agent. Do not restart it with the
+   cancelled registration name; the server rejects cancelled registrations.
+7. The agent takes the source lease, verifies that CCD Master has no row for
+   the stable source, and performs a non-destructive full insert. It does not
+   clear Master and it does not call the identity-retirement service.
+
+If the server finds rows for that source while the cache is absent or belongs
+to another registration revision, the run stops before mutation and Desk shows
+`Reconciliation Required`. Investigate the source/cache identity instead of
+deleting the cache again.
+
 ## Deployment command
 
 ```bash
@@ -94,6 +125,9 @@ can complete an empty post-processing run.
   acquisition also reuses the same token.
 - downstream errors: keep fast mode limited to the canary, resolve the logged
   record failures, then rerun. The delta checkpoint preserves confirmed rows.
+- `Reconciliation Required`: read **Latest Error**. Missing/mismatched cache
+  with a populated source and client-side source-key deletions are deliberately
+  fail-closed; no Master clearing or deletion was attempted.
 - unsupported autoname: use legacy mode until a reviewed allocator is added for
   that exact naming rule.
 

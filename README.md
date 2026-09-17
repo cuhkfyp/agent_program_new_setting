@@ -25,6 +25,14 @@ Manager changes that registration to `Fast Bulk Insert`.
   second mutation of the same source.
 - Fast mode is limited to CCD Master's current static format naming rule. An
   unsupported naming rule fails closed and must use legacy mode.
+- A missing or revision-mismatched Master cache never authorizes a clear. The
+  bulk macro takes the per-source central lease, verifies that the source is
+  empty, and then performs inserts only. A populated source is shown as
+  `Reconciliation Required` in the registration's Agent Sync tab.
+- Agent delta detection never physically deletes CCD Master rows. A removed
+  source key fails closed as `Reconciliation Required`; governed registration
+  cancellation and identity retirement remain the authority for source
+  deletion.
 
 ## Repository layout
 
@@ -112,6 +120,7 @@ Mode** to `Legacy Document Insert`; the agent uses the existing Server Script
 route on its next changed run. Disabling **Central Agent Sync** globally also
 returns every registration to legacy compatibility mode.
 
-The new server files have unique names and require no `hooks.py` edit. The
-installer only owns fields prefixed `agent_sync_` plus the dedicated settings
-DocType and index.
+The new server files have unique names and require no `hooks.py` edit. They do
+not import or replace `api_identity_retirement.py`, its cancellation hooks, or
+the **Cancel with Identity Retirement** action. The installer only owns fields
+prefixed `agent_sync_` plus the dedicated settings DocType and index.

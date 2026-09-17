@@ -448,7 +448,7 @@ def _api_message(response):
         return {{}}
 
 def get_master_sync_config(session, log_prefix):
-    """Fetch optional central settings; None means keep the legacy behavior."""
+    """Fetch optional central settings used by coordinated CCD Master sync."""
     response = request_with_retry(
         session,
         "GET",
@@ -463,7 +463,7 @@ def get_master_sync_config(session, log_prefix):
     )
     if response.status_code != 200:
         write_log(
-            f"{{log_prefix}}: central sync API unavailable (HTTP {{response.status_code}}); using legacy compatibility mode",
+            f"{{log_prefix}}: central sync API unavailable (HTTP {{response.status_code}}); safe bootstrap is disabled",
             "WARN",
         )
         return None
@@ -576,23 +576,91 @@ def report_zero_delta(session, config, log_prefix):
     except Exception as report_error:
         write_log(f"{{log_prefix}}: could not report zero-delta state: {{report_error}}", "WARN")
 
-def load_delta_cache(cache_path):
-    """Load delta cache. Returns {{ccd_source_key: hash}} dict or None if missing/invalid."""
+def report_reconciliation_required(session, config, reason_code, log_prefix):
+    if not config:
+        return
+    try:
+        response = request_with_retry(
+            session,
+            "POST",
+            f"{{erpnext_url}}/api/method/{{AGENT_SYNC_API}}.report_reconciliation_required",
+            log_prefix,
+            json={{
+                "registration": registration_id,
+                "source_id": source_id,
+                "reason_code": reason_code,
+                "physical_hostname": physical_hostname,
+                "database_name": db_database,
+            }},
+        )
+        if response.status_code != 200:
+            write_log(
+                f"{{log_prefix}}: could not expose reconciliation state (HTTP {{response.status_code}})",
+                "WARN",
+            )
+    except Exception as report_error:
+        write_log(f"{{log_prefix}}: could not expose reconciliation state: {{report_error}}", "WARN")
+
+def inspect_master_source_state(session, lease, log_prefix):
+    if not lease:
+        raise RuntimeError("central coordination lease is required for safe bootstrap")
+    response = request_with_retry(
+        session,
+        "POST",
+        f"{{erpnext_url}}/api/method/{{AGENT_SYNC_API}}.inspect_master_source_state",
+        log_prefix,
+        json={{
+            "registration": registration_id,
+            "source_id": source_id,
+            "lease_token": lease["token"],
+            "run_id": lease["run_id"],
+        }},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"central source inspection failed (HTTP {{response.status_code}}): {{response.text[:300]}}"
+        )
+    state = _api_message(response)
+    if not isinstance(state, dict) or "master_has_rows" not in state:
+        raise RuntimeError("central source inspection returned an invalid response")
+    return state
+
+def load_delta_cache_state(cache_path):
+    """Load validated cache data, including registration-generation metadata."""
     try:
         with open(cache_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if data.get("version") == 1 and isinstance(data.get("records"), dict):
-            return data["records"]
+        if (
+            isinstance(data, dict)
+            and data.get("version") in (1, 2)
+            and isinstance(data.get("records"), dict)
+        ):
+            return data
     except Exception:
         pass
     return None
+
+def load_delta_cache(cache_path):
+    """Load delta cache. Returns {{ccd_source_key: hash}} dict or None if missing/invalid."""
+    state = load_delta_cache_state(cache_path)
+    return state.get("records") if state else None
 
 def save_delta_cache(cache_path, records_dict):
     """Save delta cache {{ccd_source_key: hash}} to file."""
     temp_path = cache_path + ".tmp"
     try:
         os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        data = {{"version": 1, "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": records_dict}}
+        generation_material = f"{{source_id}}\x1f{{registration_id}}"
+        data = {{
+            "version": 2,
+            "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source_id": source_id,
+            "registration_id": registration_id,
+            "sync_generation": _hashlib.sha256(
+                generation_material.encode("utf-8")
+            ).hexdigest(),
+            "records": records_dict,
+        }}
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(data, f)
         os.replace(temp_path, cache_path)
@@ -609,7 +677,7 @@ def invalidate_delta_cache(cache_path, log_prefix):
     try:
         if os.path.exists(cache_path):
             os.remove(cache_path)
-        write_log(f"{{log_prefix}}: cache invalidated; next run will perform a full resync", "WARN")
+        write_log(f"{{log_prefix}}: cache invalidated; next run requires safe source inspection", "WARN")
     except Exception as error:
         write_log(f"{{log_prefix}}: could not invalidate cache: {{error}}", "ERROR")
 
@@ -1292,6 +1360,13 @@ def execute_step(step, prev_result):
                 return prev_result
 
             _master_sync_config = get_master_sync_config(sess, "SYNC_TO_CCD_MASTER_BULK")
+            if not _master_sync_config:
+                write_log(
+                    "SYNC_TO_CCD_MASTER_BULK: active registration validation "
+                    "through the central sync API is required; no Master rows changed",
+                    "ERROR",
+                )
+                return prev_result
 
             def acquire_master_mutation_slot():
                 nonlocal master_sync_lock, central_master_lease
@@ -1470,7 +1545,27 @@ def execute_step(step, prev_result):
                 client_map_master[_key] = (_hash, _mrow)
 
             _cache_path = os.path.join(os.path.dirname(log_file), f"{{source_id}}_CCD-Master_delta_cache.json")
-            _cache = load_delta_cache(_cache_path)
+            _cache_state = load_delta_cache_state(_cache_path)
+            _cache = _cache_state.get("records") if _cache_state else None
+            _expected_generation = (
+                str(_master_sync_config.get("sync_generation") or "")
+                if _master_sync_config
+                else ""
+            )
+            _cache_scope_mismatch = bool(
+                _cache_state
+                and _cache_state.get("version") == 2
+                and (
+                    str(_cache_state.get("source_id") or "") != source_id
+                    or str(_cache_state.get("registration_id") or "") != registration_id
+                    or not _expected_generation
+                    or str(_cache_state.get("sync_generation") or "")
+                    != _expected_generation
+                )
+            )
+            _legacy_cache = bool(
+                _cache_state and _cache_state.get("version") == 1
+            )
             _progress_cache = dict(_cache or {{}})
             _progress_ready = _cache is not None
             batch_size = (
@@ -1508,8 +1603,112 @@ def execute_step(step, prev_result):
                     write_log(f"SYNC_TO_CCD_MASTER_BULK: reconciled {{confirmed}} committed row(s) after an ambiguous insert")
                 return confirmed
 
-            if _cache is None:
-                write_log(f"SYNC_TO_CCD_MASTER_BULK: no cache — running full sync")
+            _bootstrap_required = _cache is None or _cache_scope_mismatch
+            _inspection_required = _bootstrap_required or _legacy_cache
+            if _inspection_required:
+                if not (
+                    _master_sync_config
+                    and _master_sync_config.get("coordination_enabled")
+                ):
+                    _master_sync_error = (
+                        "safe bootstrap requires the central sync API and coordination"
+                    )
+                    report_reconciliation_required(
+                        sess,
+                        _master_sync_config,
+                        "safe_bootstrap_unavailable",
+                        "SYNC_TO_CCD_MASTER_BULK",
+                    )
+                    write_log(
+                        "SYNC_TO_CCD_MASTER_BULK: Reconciliation Required — "
+                        "central coordination is unavailable; no Master rows changed",
+                        "ERROR",
+                    )
+                    return prev_result
+                acquire_master_mutation_slot()
+                if not central_master_lease:
+                    _master_sync_error = "central lease unavailable for safe bootstrap"
+                    report_reconciliation_required(
+                        sess,
+                        _master_sync_config,
+                        "safe_bootstrap_unavailable",
+                        "SYNC_TO_CCD_MASTER_BULK",
+                    )
+                    write_log(
+                        "SYNC_TO_CCD_MASTER_BULK: Reconciliation Required — "
+                        "central lease unavailable; no Master rows changed",
+                        "ERROR",
+                    )
+                    return prev_result
+                try:
+                    _source_state = inspect_master_source_state(
+                        sess, central_master_lease, "SYNC_TO_CCD_MASTER_BULK"
+                    )
+                except Exception:
+                    report_reconciliation_required(
+                        sess,
+                        _master_sync_config,
+                        "safe_bootstrap_unavailable",
+                        "SYNC_TO_CCD_MASTER_BULK",
+                    )
+                    raise
+                _source_has_rows = bool(_source_state.get("master_has_rows"))
+                if _bootstrap_required and _source_has_rows:
+                    _reason_code = (
+                        "cache_scope_mismatch_source_populated"
+                        if _cache_scope_mismatch
+                        else "cache_missing_source_populated"
+                    )
+                    _master_sync_error = (
+                        "Reconciliation Required: cache cannot be bootstrapped over "
+                        "existing CCD Master rows"
+                    )
+                    report_reconciliation_required(
+                        sess,
+                        _master_sync_config,
+                        _reason_code,
+                        "SYNC_TO_CCD_MASTER_BULK",
+                    )
+                    write_log(
+                        "SYNC_TO_CCD_MASTER_BULK: Reconciliation Required — "
+                        "source already has Master rows; automatic clearing is disabled",
+                        "ERROR",
+                    )
+                    return prev_result
+                if _legacy_cache and not _source_has_rows:
+                    if _progress_cache and not str(
+                        _master_sync_config.get("amended_from") or ""
+                    ):
+                        _master_sync_error = (
+                            "Reconciliation Required: legacy cache has rows while the "
+                            "active source is empty"
+                        )
+                        report_reconciliation_required(
+                            sess,
+                            _master_sync_config,
+                            "safe_bootstrap_unavailable",
+                            "SYNC_TO_CCD_MASTER_BULK",
+                        )
+                        write_log(
+                            "SYNC_TO_CCD_MASTER_BULK: Reconciliation Required — "
+                            "legacy cache is non-empty but source is empty",
+                            "ERROR",
+                        )
+                        return prev_result
+                    _bootstrap_required = True
+                elif _legacy_cache:
+                    # One-time migration: source is populated and scoped by the
+                    # current lease, so preserve the records and add generation metadata.
+                    save_delta_cache(_cache_path, _progress_cache)
+                    write_log(
+                        "SYNC_TO_CCD_MASTER_BULK: upgraded legacy delta cache metadata"
+                    )
+
+            if _bootstrap_required:
+                write_log(
+                    "SYNC_TO_CCD_MASTER_BULK: verified empty source — "
+                    "starting non-destructive full insert"
+                )
                 try:
                     with open(_full_sync_pending_path, "w", encoding="utf-8") as marker:
                         marker.write(_master_run_id)
@@ -1518,18 +1717,9 @@ def execute_step(step, prev_result):
                         f"SYNC_TO_CCD_MASTER_BULK: could not create full-sync marker: {{marker_error}}",
                         "WARN",
                     )
-                acquire_master_mutation_slot()
-                clear_r = request_with_retry(
-                    sess, "POST", f"{{erpnext_url}}/api/method/agent_bulk_sync", "SYNC_TO_CCD_MASTER_BULK",
-                    json={{"action": "clear", "doctype": "CCD Master", "source_id": source_id, "hostname": source_id}}
-                )
-                if clear_r.status_code != 200:
-                    write_log(f"SYNC_TO_CCD_MASTER_BULK: clear failed ({{clear_r.status_code}}): {{clear_r.text[:300]}}", "ERROR")
-                    return prev_result
                 _progress_cache.clear()
                 _progress_ready = True
                 save_delta_cache(_cache_path, _progress_cache)
-                write_log(f"SYNC_TO_CCD_MASTER_BULK: cleared all existing records for {{source_id}} (bulk)")
                 all_rows = [row for ck, (ch, row) in client_map_master.items()]
                 total_rows = len(all_rows)
                 for i in range(0, total_rows, batch_size):
@@ -1567,6 +1757,25 @@ def execute_step(step, prev_result):
                 to_update = [row for ck, (ch, row) in client_map_master.items() if ck in _progress_cache and ch != _progress_cache[ck]]
                 write_log(f"SYNC_TO_CCD_MASTER_BULK: delta — {{len(to_insert)}} insert, {{len(to_delete)}} delete, {{len(to_update)}} update")
 
+                if to_delete:
+                    _master_sync_error = (
+                        f"Reconciliation Required: {{len(to_delete)}} source-key "
+                        "deletion(s) detected"
+                    )
+                    report_reconciliation_required(
+                        sess,
+                        _master_sync_config,
+                        "source_deletions_detected",
+                        "SYNC_TO_CCD_MASTER_BULK",
+                    )
+                    write_log(
+                        f"SYNC_TO_CCD_MASTER_BULK: Reconciliation Required — "
+                        f"{{len(to_delete)}} deletion(s) detected; automatic Master "
+                        "deletion is disabled and no delta changes were applied",
+                        "ERROR",
+                    )
+                    return prev_result
+
                 if to_insert or to_delete or to_update:
                     acquire_master_mutation_slot()
                 else:
@@ -1598,25 +1807,6 @@ def execute_step(step, prev_result):
                         write_log("SYNC_TO_CCD_MASTER_BULK: pausing 15 seconds after ambiguous insert failure", "WARN")
                         time.sleep(15)
                         reconcile_master_rows(chunk)
-
-                for i in range(0, len(to_delete), batch_size):
-                    chunk = to_delete[i:i + batch_size]
-                    del_r = request_with_retry(
-                        sess, "POST", f"{{erpnext_url}}/api/method/agent_bulk_sync", "SYNC_TO_CCD_MASTER_BULK",
-                        json={{"action": "delete_by_source_keys", "doctype": "CCD Master", "source_id": source_id, "hostname": source_id, "keys": json.dumps(chunk)}}
-                    )
-                    if central_master_lease:
-                        heartbeat_central_sync_lease(
-                            sess, central_master_lease, "SYNC_TO_CCD_MASTER_BULK"
-                        )
-                    if del_r.status_code == 200:
-                        deleted += del_r.json().get("message", {{}}).get("deleted", len(chunk))
-                        for deleted_key in chunk:
-                            _progress_cache.pop(deleted_key, None)
-                        save_delta_cache(_cache_path, _progress_cache)
-                    else:
-                        errors += len(chunk)
-                        write_log(f"SYNC_TO_CCD_MASTER_BULK: delete failed ({{del_r.status_code}}): {{del_r.text[:300]}}", "ERROR")
 
                 for i in range(0, len(to_update), batch_size):
                     chunk = to_update[i:i + batch_size]
@@ -1768,6 +1958,17 @@ def execute_step(step, prev_result):
                 write_log(f"SYNC_TO_CCD_MASTER: login failed ({{login_r.status_code}})", "ERROR")
                 return prev_result
 
+            _master_sync_config = get_master_sync_config(
+                sess, "SYNC_TO_CCD_MASTER"
+            )
+            if not _master_sync_config:
+                write_log(
+                    "SYNC_TO_CCD_MASTER: active registration validation through "
+                    "the central sync API is required; no Master rows changed",
+                    "ERROR",
+                )
+                return prev_result
+
             # Fetch fieldmatch from CCD Registration
             reg_r = request_with_retry(
                 sess, "GET", f"{{erpnext_url}}/api/resource/CCD Registration/{{_urlquote(registration_id, safe='')}}",
@@ -1900,63 +2101,40 @@ def execute_step(step, prev_result):
                     _progress_cache[checkpoint_key] = client_map_master[checkpoint_key][0]
 
             if _cache is None:
-                write_log(f"SYNC_TO_CCD_MASTER: no cache — running full sync")
-                filters_json = json.dumps([["ccd_reg_source", "=", source_id]])
-                all_existing_master = []
-                _limit = 500
-                _start = 0
-                _master_doctype_url = _urlquote("CCD Master", safe='')
-                while True:
-                    page_r = request_with_retry(
-                        sess, "GET", f"{{erpnext_url}}/api/resource/{{_master_doctype_url}}", "SYNC_TO_CCD_MASTER",
-                        params={{"filters": filters_json,
-                                 "fields": '["name"]',
-                                 "limit_page_length": _limit,
-                                 "limit_start": _start}}
-                    )
-                    if page_r.status_code != 200:
-                        errors += 1
-                        write_log(f"SYNC_TO_CCD_MASTER: list failed ({{page_r.status_code}}): {{page_r.text[:300]}}", "ERROR")
-                        return prev_result
-                    page_data = page_r.json().get("data", [])
-                    if not page_data:
-                        break
-                    all_existing_master.extend(page_data)
-                    if len(page_data) < _limit:
-                        break
-                    _start += _limit
-                for item in all_existing_master:
-                    delete_r = request_with_retry(
-                        sess, "DELETE", f"{{erpnext_url}}/api/resource/{{_master_doctype_url}}/{{_urlquote(item['name'], safe='')}}",
-                        "SYNC_TO_CCD_MASTER"
-                    )
-                    if delete_r.status_code not in (200, 202):
-                        errors += 1
-                        write_log(f"SYNC_TO_CCD_MASTER: delete failed ({{delete_r.status_code}}): {{delete_r.text[:300]}}", "ERROR")
-                if errors:
-                    invalidate_delta_cache(_cache_path, "SYNC_TO_CCD_MASTER")
-                    return prev_result
-                _progress_cache.clear()
-                _progress_ready = True
-                save_delta_cache(_cache_path, _progress_cache)
-                write_log(f"SYNC_TO_CCD_MASTER: cleared {{len(all_existing_master)}} existing record(s) for {{source_id}}")
-                for ck, (ch, crow) in client_map_master.items():
-                    r = request_with_retry(
-                        sess, "POST", f"{{erpnext_url}}/api/resource/{{_master_doctype_url}}", "SYNC_TO_CCD_MASTER",
-                        safe_to_retry=False, json=crow
-                    )
-                    if r.status_code in (200, 201):
-                        created += 1
-                        checkpoint_master_row(crow)
-                        save_delta_cache(_cache_path, _progress_cache)
-                    else:
-                        errors += 1
-                        write_log(f"SYNC_TO_CCD_MASTER: insert error ({{r.status_code}}): {{r.text[:300]}}", "ERROR")
+                report_reconciliation_required(
+                    sess,
+                    _master_sync_config,
+                    "safe_bootstrap_unavailable",
+                    "SYNC_TO_CCD_MASTER",
+                )
+                write_log(
+                    "SYNC_TO_CCD_MASTER: Reconciliation Required — the legacy "
+                    "macro cannot safely bootstrap a missing cache. Use "
+                    "SYNC_TO_CCD_MASTER_BULK with central coordination; no Master "
+                    "rows changed",
+                    "ERROR",
+                )
+                return prev_result
             else:
                 to_insert = [row for ck, (ch, row) in client_map_master.items() if ck not in _cache]
                 to_delete = [ck for ck in _cache if ck not in client_map_master]
                 to_update = [row for ck, (ch, row) in client_map_master.items() if ck in _cache and ch != _cache[ck]]
                 write_log(f"SYNC_TO_CCD_MASTER: delta — {{len(to_insert)}} insert, {{len(to_delete)}} delete, {{len(to_update)}} update")
+
+                if to_delete:
+                    report_reconciliation_required(
+                        sess,
+                        _master_sync_config,
+                        "source_deletions_detected",
+                        "SYNC_TO_CCD_MASTER",
+                    )
+                    write_log(
+                        f"SYNC_TO_CCD_MASTER: Reconciliation Required — "
+                        f"{{len(to_delete)}} deletion(s) detected; automatic Master "
+                        "deletion is disabled and no delta changes were applied",
+                        "ERROR",
+                    )
+                    return prev_result
 
                 for _row in to_insert:
                     _master_doctype_url = _urlquote("CCD Master", safe='')
@@ -1971,21 +2149,6 @@ def execute_step(step, prev_result):
                     else:
                         errors += 1
                         write_log(f"SYNC_TO_CCD_MASTER: insert error ({{r.status_code}}): {{r.text[:300]}}", "ERROR")
-
-                for i in range(0, len(to_delete), batch_size):
-                    chunk = to_delete[i:i + batch_size]
-                    del_r = request_with_retry(
-                        sess, "POST", f"{{erpnext_url}}/api/method/agent_bulk_sync", "SYNC_TO_CCD_MASTER",
-                        json={{"action": "delete_by_source_keys", "doctype": "CCD Master", "source_id": source_id, "hostname": source_id, "keys": json.dumps(chunk)}}
-                    )
-                    if del_r.status_code == 200:
-                        deleted += del_r.json().get("message", {{}}).get("deleted", len(chunk))
-                        for deleted_key in chunk:
-                            _progress_cache.pop(deleted_key, None)
-                        save_delta_cache(_cache_path, _progress_cache)
-                    else:
-                        errors += len(chunk)
-                        write_log(f"SYNC_TO_CCD_MASTER: delete failed ({{del_r.status_code}}): {{del_r.text[:300]}}", "ERROR")
 
                 for i in range(0, len(to_update), batch_size):
                     chunk = to_update[i:i + batch_size]
