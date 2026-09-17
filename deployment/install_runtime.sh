@@ -38,7 +38,12 @@ done
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 api_source="${repo_dir}/server/api_agent_sync.py"
 setup_source="${repo_dir}/server/agent_sync_setup.py"
+agent_asset_sources=(
+  "${repo_dir}/agent/setup_windows.bat"
+  "${repo_dir}/agent/setup_windows_no_powershell.bat"
+)
 app_target="/home/frappe/frappe-bench/apps/db_connector/db_connector"
+agent_asset_target="${app_target}/agent_assets"
 containers=(
   "${prefix}-backend-1"
   "${prefix}-queue-long-1"
@@ -56,6 +61,10 @@ for container in "${containers[@]}"; do
   fi
   docker cp "$api_source" "${container}:${app_target}/api_agent_sync.py"
   docker cp "$setup_source" "${container}:${app_target}/agent_sync_setup.py"
+  docker exec "$container" mkdir -p "$agent_asset_target"
+  for asset_source in "${agent_asset_sources[@]}"; do
+    docker cp "$asset_source" "${container}:${agent_asset_target}/$(basename "$asset_source")"
+  done
   docker exec "$container" python -m py_compile \
     "${app_target}/api_agent_sync.py" \
     "${app_target}/agent_sync_setup.py"

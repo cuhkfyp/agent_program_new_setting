@@ -59,7 +59,10 @@ Manager changes that registration to `Fast Bulk Insert`.
 ```
 
 The installer creates `CCD Agent Sync Settings` and an `Agent Sync` tab on
-`CCD Registration`. It deliberately leaves the global switch unchanged.
+`CCD Registration`. It also adds two namespaced `CCD Agent OS Batch Template`
+records—standard Windows and CMD/curl-only—without replacing the existing
+`Windows 11`, Ubuntu, or colleague-owned templates. It deliberately leaves the
+global switch unchanged.
 
 In Desk:
 

@@ -12,6 +12,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 AGENT = ROOT / "agent" / "agent_program.py"
 API = ROOT / "server" / "api_agent_sync.py"
 SETUP = ROOT / "server" / "agent_sync_setup.py"
+DEPLOYMENT = ROOT / "deployment" / "install_runtime.sh"
 WINDOWS_SETUP = ROOT / "agent" / "setup_windows.bat"
 WINDOWS_SETUP_NO_POWERSHELL = (
     ROOT / "agent" / "setup_windows_no_powershell.bat"
@@ -159,6 +160,16 @@ class StaticContracts(unittest.TestCase):
             self.assertNotIn('rmdir /s /q "daemon_logs"', source)
             self.assertNotIn("del *delta_cache", source)
             self.assertIn("existing logs and delta caches", source)
+
+    def test_deployment_installs_namespaced_agent_templates(self) -> None:
+        deployment = DEPLOYMENT.read_text(encoding="utf-8")
+        setup = SETUP.read_text(encoding="utf-8")
+        for filename in ("setup_windows.bat", "setup_windows_no_powershell.bat"):
+            self.assertIn(filename, deployment)
+            self.assertIn(filename, setup)
+        self.assertIn('"Windows - Central Sync"', setup)
+        self.assertIn('"Windows - Central Sync (No PowerShell)"', setup)
+        self.assertNotIn('"Windows 11":', setup)
 
 
 if __name__ == "__main__":

@@ -71,9 +71,12 @@ under a central lease.
 5. Amend the cancelled registration, submit the amended document, and retain
    the governed stable source key. The amended document name is the new
    registration revision.
-6. Reconfigure/reinstall that client so its `registration_id` is the submitted
-   amended document name, then start the agent. Do not restart it with the
-   cancelled registration name; the server rejects cancelled registrations.
+6. On the amended draft, select `Windows - Central Sync` or, for a computer
+   without PowerShell, `Windows - Central Sync (No PowerShell)`. Submit it and
+   use **Agent Information → Click to download**. Install into the existing
+   agent folder so logs/caches are preserved, then start the agent. The agent
+   discovers the new submitted registration by physical hostname; the server
+   rejects cancelled registrations.
 7. The agent takes the source lease, verifies that CCD Master has no row for
    the stable source, and performs a non-destructive full insert. It does not
    clear Master and it does not call the identity-retirement service.

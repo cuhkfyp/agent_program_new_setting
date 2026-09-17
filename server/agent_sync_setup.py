@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import frappe
 
 
 SETTINGS_DOCTYPE = "CCD Agent Sync Settings"
+AGENT_TEMPLATE_DOCTYPE = "CCD Agent OS Batch Template"
+AGENT_TEMPLATE_ASSETS = {
+    "Windows - Central Sync": "setup_windows.bat",
+    "Windows - Central Sync (No PowerShell)": "setup_windows_no_powershell.bat",
+}
 
 
 SETTINGS_FIELDS: list[dict[str, Any]] = [
@@ -332,6 +338,44 @@ def _initialize_defaults() -> None:
             frappe.db.set_single_value(SETTINGS_DOCTYPE, fieldname, value)
 
 
+def _install_agent_templates() -> list[dict[str, Any]]:
+    """Upsert only namespaced templates; preserve all existing colleague templates."""
+    if not frappe.db.exists("DocType", AGENT_TEMPLATE_DOCTYPE):
+        return []
+    asset_directory = Path(__file__).with_name("agent_assets")
+    results = []
+    for template_name, filename in AGENT_TEMPLATE_ASSETS.items():
+        asset_path = asset_directory / filename
+        if not asset_path.is_file():
+            frappe.throw(f"Required agent template asset is missing: {filename}")
+        content = asset_path.read_text(encoding="utf-8")
+        created = not frappe.db.exists(AGENT_TEMPLATE_DOCTYPE, template_name)
+        if created:
+            frappe.get_doc(
+                {
+                    "doctype": AGENT_TEMPLATE_DOCTYPE,
+                    "name": template_name,
+                    "agent_os": template_name,
+                    "os_template": content,
+                }
+            ).insert(ignore_permissions=True)
+            changed = True
+        else:
+            template = frappe.get_doc(AGENT_TEMPLATE_DOCTYPE, template_name)
+            changed = bool(
+                str(template.get("agent_os") or "") != template_name
+                or str(template.get("os_template") or "") != content
+            )
+            if changed:
+                template.agent_os = template_name
+                template.os_template = content
+                template.save(ignore_permissions=True)
+        results.append(
+            {"name": template_name, "created": created, "updated": changed}
+        )
+    return results
+
+
 def _add_indexes() -> list[str]:
     indexes = []
     index_name = "idx_ccd_master_agent_sync_run"
@@ -354,6 +398,7 @@ def install() -> dict[str, Any]:
 
     create_custom_fields(_custom_fields(), update=True)
     _initialize_defaults()
+    agent_templates = _install_agent_templates()
     indexes = _add_indexes()
     frappe.clear_cache(doctype="CCD Registration")
     frappe.clear_cache(doctype="CCD Master")
@@ -366,6 +411,7 @@ def install() -> dict[str, Any]:
             "CCD Registration-agent_sync_state",
             "CCD Master-agent_sync_run_id",
         ],
+        "agent_templates": agent_templates,
         "indexes_added": indexes,
         "enabled": bool(frappe.db.get_single_value(SETTINGS_DOCTYPE, "enabled")),
     }
