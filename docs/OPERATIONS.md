@@ -39,16 +39,18 @@ development defaults, not universal production values.
 
 Stop the old parent process, watchdog, and detached job daemon before starting
 the new agent. Install the new files in the same agent directory if the intent
-is to reuse the existing `daemon_logs/*_delta_cache.json` checkpoints. Starting
-from a new empty directory intentionally causes a full source resynchronization.
+is to reuse the existing `daemon_logs/*_delta_cache.json` checkpoints. Do not
+start from a new empty directory for an existing CCD Master source; a missing
+checkpoint requires an explicit reconciliation procedure.
 
-Run `agent/setup_windows.bat` once to install dependencies and store the URL,
-integration account, site, and Socket.IO namespace in Windows Credential
-Manager. Then start `Run_Agent.bat`. Confirm the log shows the governed stable
-source ID and central configuration before forcing a full-sync benchmark.
+Run `agent/setup_windows.bat` for the normal curl/PowerShell-fallback path, or
+`agent/setup_windows_no_powershell.bat` for the CMD/curl-only path. Both install
+checksum-pinned assets and store the URL, integration account, site, and
+Socket.IO namespace in Windows Credential Manager. Then start `Run_Agent.bat`.
+Confirm the log shows the governed stable source ID and central configuration.
 
-Do not delete a delta cache merely to test connectivity: cache deletion clears
-and rebuilds that source in CCD Master.
+Do not delete a delta cache merely to test connectivity. Cache absence is not
+authorization to delete, retire, or rebuild an existing CCD Master source.
 
 ## Deployment command
 

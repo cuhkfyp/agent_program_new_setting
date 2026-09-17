@@ -30,9 +30,12 @@ Manager changes that registration to `Fast Bulk Insert`.
 
 - `agent/agent_program.py` — sanitized cross-platform agent with central
   coordination and a legacy fallback.
-- `agent/setup_windows.bat` and `agent/configure_agent.py` — client setup that
-  stores endpoint/account values in the OS credential store without embedding
-  them in source or generated launchers.
+- `agent/setup_windows.bat` — normal Windows installer; it prefers `curl.exe`
+  and can use Windows PowerShell as its download fallback.
+- `agent/setup_windows_no_powershell.bat` — CMD/curl-only installer for older
+  managed computers that cannot run PowerShell.
+- `agent/configure_agent.py` — stores endpoint/account values in the OS
+  credential store without embedding them in source or generated launchers.
 - `server/api_agent_sync.py` — authenticated lease, bulk insert, state, and
   post-processing API.
 - `server/agent_sync_setup.py` — idempotent DocType/custom-field installer.
@@ -65,15 +68,31 @@ promote more registrations until both ingestion and post-processing finish.
 ## Agent configuration
 
 No deployment URL, username, password, cookie, or client database credential is
-stored in this repository. On Windows, run:
+stored in this repository. On a normal Windows computer, run:
 
 ```text
 agent\setup_windows.bat
 ```
 
-The setup installs dependencies, prompts for deployment values, saves them in
-Windows Credential Manager, and creates `Run_Agent.bat`. Alternatively,
-configure the endpoint/account through environment variables:
+For an older computer that cannot run PowerShell, provide `curl.exe` in the
+installer directory or Windows `PATH`, then run:
+
+```text
+agent\setup_windows_no_powershell.bat
+```
+
+Both installers can install Python, download the same checksum-pinned agent
+assets, install dependencies, reuse or replace existing Windows Credential
+Manager values, and create `Run_Agent.bat`. Neither installer removes
+`daemon_logs` or delta-cache files. `CCD_AGENT_ARTIFACT_BASE_URL` may be set by
+the deployment environment to use an approved internal artifact origin instead
+of the repository default.
+
+The agent logs in over outbound HTTPS and opens a direct outbound WebSocket over
+the same ERPNext endpoint. No inbound port or listener is required on the client
+computer.
+
+Alternatively, configure the endpoint/account through environment variables:
 
 ```text
 CCD_ERPNEXT_URL=https://erp.example.org

@@ -2,10 +2,9 @@
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
-REM CCD Agent Windows installer (normal edition).
-REM Uses curl.exe when available and Windows PowerShell only as a download
-REM fallback. All application files are verified before the installed copy is
-REM replaced. Existing daemon_logs and delta-cache files are never touched.
+REM CCD Agent Windows installer for older managed computers.
+REM Requires curl.exe and otherwise uses only cmd.exe plus the Python runtime it
+REM installs. Existing daemon_logs and delta-cache files are never touched.
 
 set "PYTHON_INSTALLER_URL=https://www.python.org/ftp/python/3.13.10/python-3.13.10-amd64.exe"
 if not defined CCD_AGENT_ARTIFACT_BASE_URL set "CCD_AGENT_ARTIFACT_BASE_URL=https://raw.githubusercontent.com/cuhkfyp/agent_program_new_setting/main/agent"
@@ -18,12 +17,18 @@ set "PYTHON_EXE="
 set "CURL_EXE="
 
 echo ===========================================
-echo    CCD Agent Setup for Windows
+echo    CCD Agent Setup for Older Windows
 echo ===========================================
 echo This installer keeps existing logs and delta caches.
 echo.
 
 call :find_curl
+if not defined CURL_EXE (
+    echo ERROR: curl.exe is required by this installer but was not found.
+    echo Copy curl.exe to this folder or install it in the Windows PATH, then retry.
+    goto :failed
+)
+
 call :find_python
 if not defined PYTHON_EXE call :install_python
 if errorlevel 1 goto :failed
@@ -160,13 +165,7 @@ if not defined PYTHON_EXE (
 exit /b 0
 
 :download
-set "DOWNLOAD_URL=%~1"
-set "DOWNLOAD_TARGET=%~2"
-if defined CURL_EXE (
-    "%CURL_EXE%" --fail --location --retry 3 --connect-timeout 30 "%DOWNLOAD_URL%" --output "%DOWNLOAD_TARGET%"
-    exit /b !ERRORLEVEL!
-)
-powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; (New-Object Net.WebClient).DownloadFile($env:DOWNLOAD_URL,$env:DOWNLOAD_TARGET)"
+"%CURL_EXE%" --fail --location --retry 3 --connect-timeout 30 "%~1" --output "%~2"
 exit /b %ERRORLEVEL%
 
 :verify_sha256

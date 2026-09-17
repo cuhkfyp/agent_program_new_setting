@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import pathlib
 import py_compile
+import re
 import unittest
 
 
@@ -10,6 +12,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 AGENT = ROOT / "agent" / "agent_program.py"
 API = ROOT / "server" / "api_agent_sync.py"
 SETUP = ROOT / "server" / "agent_sync_setup.py"
+WINDOWS_SETUP = ROOT / "agent" / "setup_windows.bat"
+WINDOWS_SETUP_NO_POWERSHELL = (
+    ROOT / "agent" / "setup_windows_no_powershell.bat"
+)
+CONFIGURE_AGENT = ROOT / "agent" / "configure_agent.py"
+REQUIREMENTS = ROOT / "agent" / "requirements.txt"
 
 
 class StaticContracts(unittest.TestCase):
@@ -50,6 +58,53 @@ class StaticContracts(unittest.TestCase):
         )
         unsafe_test_credential = "password=" + '"root"'
         self.assertNotIn(unsafe_test_credential, AGENT.read_text(encoding="utf-8"))
+
+    def test_both_windows_installers_target_the_same_agent_contract(self) -> None:
+        normal = WINDOWS_SETUP.read_text(encoding="utf-8")
+        legacy = WINDOWS_SETUP_NO_POWERSHELL.read_text(encoding="utf-8")
+        required_fragments = (
+            "agent_program.py",
+            "configure_agent.py",
+            "requirements.txt",
+            "Run_Agent.bat",
+            "ccd_agent",
+            "erpnext_url",
+            "erpnext_user",
+            "erpnext_pass",
+            "CCD_AGENT_ARTIFACT_BASE_URL",
+        )
+        for fragment in required_fragments:
+            self.assertIn(fragment, normal)
+            self.assertIn(fragment, legacy)
+        self.assertIn("powershell -nologo", normal.lower())
+        self.assertNotIn("powershell", legacy.lower())
+        self.assertNotIn("hksrfam", normal.lower())
+        self.assertNotIn("hksrfam", legacy.lower())
+
+    def test_windows_installer_checksums_match_packaged_assets(self) -> None:
+        expected_assets = {
+            "AGENT_SHA256": AGENT,
+            "CONFIGURE_SHA256": CONFIGURE_AGENT,
+            "REQUIREMENTS_SHA256": REQUIREMENTS,
+        }
+        for installer in (WINDOWS_SETUP, WINDOWS_SETUP_NO_POWERSHELL):
+            source = installer.read_text(encoding="utf-8")
+            for variable, asset in expected_assets.items():
+                match = re.search(
+                    rf'^set "{variable}=([0-9a-f]{{64}})"$',
+                    source,
+                    flags=re.MULTILINE,
+                )
+                self.assertIsNotNone(match, f"{variable} missing in {installer.name}")
+                actual = hashlib.sha256(asset.read_bytes()).hexdigest()
+                self.assertEqual(match.group(1), actual)
+
+    def test_windows_installers_preserve_sync_state(self) -> None:
+        for installer in (WINDOWS_SETUP, WINDOWS_SETUP_NO_POWERSHELL):
+            source = installer.read_text(encoding="utf-8").lower()
+            self.assertNotIn('rmdir /s /q "daemon_logs"', source)
+            self.assertNotIn("del *delta_cache", source)
+            self.assertIn("existing logs and delta caches", source)
 
 
 if __name__ == "__main__":
