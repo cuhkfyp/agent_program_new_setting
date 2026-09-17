@@ -22,6 +22,34 @@ REQUIREMENTS = ROOT / "agent" / "requirements.txt"
 
 
 class StaticContracts(unittest.TestCase):
+    def _generated_daemon_source(self) -> str:
+        tree = ast.parse(AGENT.read_text(encoding="utf-8"))
+        builder = next(
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "build_job_daemon_script"
+        )
+        namespace: dict[str, object] = {}
+        exec(
+            compile(
+                ast.Module(body=[builder], type_ignores=[]),
+                str(AGENT),
+                "exec",
+            ),
+            namespace,
+        )
+        return namespace["build_job_daemon_script"](
+            job_name="JOB01",
+            task_name="contract-test",
+            actions=["SYNC_TO_CCD_MASTER_BULK"],
+            interval_seconds=60,
+            log_file="agent-test.log",
+            registration_id="REG-2",
+            source_id="HOST-DB",
+            physical_hostname="HOST",
+        )
+
     def test_python_sources_compile(self) -> None:
         for path in (AGENT, API, SETUP):
             py_compile.compile(str(path), doraise=True)
@@ -47,33 +75,45 @@ class StaticContracts(unittest.TestCase):
         self.assertIn("_require_lease", source)
 
     def test_generated_daemon_source_compiles(self) -> None:
-        tree = ast.parse(AGENT.read_text(encoding="utf-8"))
-        builder = next(
+        script = self._generated_daemon_source()
+        compile(script, "<generated-daemon>", "exec")
+
+    def test_blank_temporal_values_are_database_nulls(self) -> None:
+        script = self._generated_daemon_source()
+        tree = ast.parse(script)
+        normalizer = next(
             node
             for node in tree.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "build_job_daemon_script"
+            and node.name == "normalize_mapped_value"
         )
         namespace: dict[str, object] = {}
         exec(
             compile(
-                ast.Module(body=[builder], type_ignores=[]),
-                str(AGENT),
+                ast.Module(body=[normalizer], type_ignores=[]),
+                "<generated-normalizer>",
                 "exec",
             ),
             namespace,
         )
-        script = namespace["build_job_daemon_script"](
-            job_name="JOB01",
-            task_name="contract-test",
-            actions=["SYNC_TO_CCD_MASTER_BULK"],
-            interval_seconds=60,
-            log_file="agent-test.log",
-            registration_id="REG-2",
-            source_id="HOST-DB",
-            physical_hostname="HOST",
+        normalize = namespace["normalize_mapped_value"]
+
+        for fieldtype in ("Date", "Datetime", " date ", "DATETIME"):
+            for value in (None, "", "   ", "\t"):
+                self.assertIsNone(normalize(fieldtype, value))
+
+        self.assertEqual(normalize("Date", "2026-09-17"), "2026-09-17")
+        self.assertEqual(
+            normalize("Datetime", "2026-09-17 12:34:56"),
+            "2026-09-17 12:34:56",
         )
-        compile(script, "<generated-daemon>", "exec")
+        self.assertEqual(normalize("Data", None), "")
+        self.assertEqual(normalize("Data", "   "), "   ")
+        self.assertEqual(
+            script.count("return normalize_mapped_value("),
+            4,
+            "all registration and Master mapping paths must share normalization",
+        )
 
     def test_master_sync_never_invokes_automatic_clear_or_delete(self) -> None:
         source = AGENT.read_text(encoding="utf-8")

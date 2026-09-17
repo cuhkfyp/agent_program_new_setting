@@ -686,6 +686,19 @@ def compute_row_hash(cleaned_row):
     to_hash = {{k: v for k, v in cleaned_row.items() if k not in ("ccd_source_key", "ccd_reg_source")}}
     return _hashlib.md5(json.dumps(sorted(to_hash.items())).encode()).hexdigest()
 
+def normalize_mapped_value(fieldtype, value, phone_normalizer=None):
+    """Convert mapped values without sending blank temporal strings to SQL."""
+    normalized_type = str(fieldtype or "Data").strip().lower()
+    if normalized_type in ("date", "datetime") and (
+        value is None or (isinstance(value, str) and not value.strip())
+    ):
+        return None
+    if value is None:
+        return ""
+    if normalized_type == "phone" and phone_normalizer:
+        return phone_normalizer(value)
+    return str(value)
+
 def extract_assignment_fields(expr):
     """Return source field names referenced by assignment helper calls."""
     if not expr:
@@ -886,11 +899,7 @@ def execute_step(step, prev_result):
 
             def clean_value_bulk_reg(field_name, val):
                 ft = fieldtype_map.get(field_name, "Data")
-                if val is None:
-                    return ""
-                if ft == "Phone":
-                    return normalize_phone_bulk_reg(val)
-                return str(val)
+                return normalize_mapped_value(ft, val, normalize_phone_bulk_reg)
 
             if isinstance(prev_result, dict) and "columns" in prev_result and "rows" in prev_result:
                 cols = prev_result["columns"]
@@ -1141,11 +1150,7 @@ def execute_step(step, prev_result):
             def clean_value(field_name, val):
                 """Convert a DB value to a Frappe-safe string, with type-aware handling."""
                 ft = fieldtype_map.get(field_name, "Data")
-                if val is None:
-                    return ""
-                if ft == "Phone":
-                    return normalize_phone(val)
-                return str(val)
+                return normalize_mapped_value(ft, val, normalize_phone)
 
             if isinstance(prev_result, dict) and "columns" in prev_result and "rows" in prev_result:
                 # Piped mode: data comes from a previous SELECT step
@@ -1483,11 +1488,7 @@ def execute_step(step, prev_result):
 
             def clean_value_bulk_master(rule, val):
                 ft = rule.get("fieldtype", "Data")
-                if val is None:
-                    return ""
-                if ft == "Phone":
-                    return normalize_phone_bulk_master(val)
-                return str(val)
+                return normalize_mapped_value(ft, val, normalize_phone_bulk_master)
 
             def _append_unique(target, values):
                 for value in values:
@@ -2025,11 +2026,7 @@ def execute_step(step, prev_result):
 
             def clean_value_master(rule, val):
                 ft = rule.get("fieldtype", "Data")
-                if val is None:
-                    return ""
-                if ft == "Phone":
-                    return normalize_phone(val)
-                return str(val)
+                return normalize_mapped_value(ft, val, normalize_phone)
 
             def _append_unique(target, values):
                 for value in values:

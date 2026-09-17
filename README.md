@@ -33,6 +33,10 @@ Manager changes that registration to `Fast Bulk Insert`.
   source key fails closed as `Reconciliation Required`; governed registration
   cancellation and identity retirement remain the authority for source
   deletion.
+- Mapped `Date` and `Datetime` values that are null, empty, or whitespace-only
+  are sent as database `NULL`, preventing strict-SQL failures during CCD-REG
+  updates and CCD Master ingestion. Other field types retain their established
+  conversion behavior.
 
 ## Repository layout
 
