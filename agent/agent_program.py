@@ -1786,7 +1786,12 @@ def execute_step(step, prev_result):
                     write_log(f"SYNC_TO_CCD_MASTER_BULK: insert batch {{_bn}}/{{_bt}} done")
             else:
                 pending_inserts = [row for ck, (ch, row) in client_map_master.items() if ck not in _progress_cache]
-                if pending_inserts:
+                # Legacy inserts are not idempotent, so reconcile them one row
+                # at a time before retrying.  The fast endpoint already checks
+                # every batch for existing source keys and reports confirmed
+                # retries; avoid turning an interrupted bulk run into tens of
+                # thousands of individual HTTP lookups.
+                if pending_inserts and not _use_fast_master_insert:
                     reconcile_master_rows(pending_inserts)
                 to_insert = [row for ck, (ch, row) in client_map_master.items() if ck not in _progress_cache]
                 to_delete = [ck for ck in _progress_cache if ck not in client_map_master]

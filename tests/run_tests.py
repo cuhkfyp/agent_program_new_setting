@@ -64,6 +64,13 @@ class StaticContracts(unittest.TestCase):
             source,
         )
 
+    def test_fast_resume_uses_idempotent_batch_confirmation(self) -> None:
+        source = AGENT.read_text(encoding="utf-8")
+        self.assertIn(
+            "if pending_inserts and not _use_fast_master_insert:",
+            source,
+        )
+
     def test_source_identity_is_not_suffix_trimmed(self) -> None:
         source = AGENT.read_text(encoding="utf-8")
         self.assertNotIn("def trim_suffix", source)
