@@ -23,6 +23,9 @@ Manager changes that registration to `Fast Bulk Insert`.
 - The global slot is released when ingestion finishes. A per-source lease stays
   active while identity and portal work runs on the long queue, preventing a
   second mutation of the same source.
+- While that background work is active, the Agent Sync tab reports both the
+  processed count and total Master rows for the run (for example,
+  `25,900 / 92,068`) and remains in `Post-processing` until completion.
 - Fast mode is limited to CCD Master's current static format naming rule. An
   unsupported naming rule fails closed and must use legacy mode.
 - A missing or revision-mismatched Master cache never authorizes a clear. The

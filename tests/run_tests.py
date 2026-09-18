@@ -75,6 +75,16 @@ class StaticContracts(unittest.TestCase):
         self.assertIn('"agent_sync_run_id"', source)
         self.assertIn("_require_lease", source)
 
+    def test_postprocess_status_shows_numerator_and_total(self) -> None:
+        source = API.read_text(encoding="utf-8")
+        self.assertIn("postprocess_total = frappe.db.count(", source)
+        self.assertIn(
+            'f"{postprocess_total:,} Master row(s); {error_count:,} error(s)"',
+            source,
+        )
+        self.assertIn('"total": postprocess_total', source)
+        self.assertIn("total=postprocess_total", source)
+
     def test_generated_daemon_source_compiles(self) -> None:
         script = self._generated_daemon_source()
         compile(script, "<generated-daemon>", "exec")

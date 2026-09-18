@@ -760,6 +760,7 @@ def _enqueue_postprocess(
     full_sync: bool,
     changed_source_keys: list[str],
     deleted_source_keys: list[str],
+    total: int = 0,
     cursor: str = "",
     processed: int = 0,
     error_count: int = 0,
@@ -779,6 +780,7 @@ def _enqueue_postprocess(
         full_sync=bool(full_sync),
         changed_source_keys=changed_source_keys,
         deleted_source_keys=deleted_source_keys,
+        total=cint(total),
         cursor=cursor,
         processed=processed,
         error_count=error_count,
@@ -822,11 +824,22 @@ def finish_sync(
     )
     if not deferred:
         frappe.throw("Unable to transfer the sync lease to post-processing")
+    postprocess_total = frappe.db.count(
+        MASTER_DOCTYPE,
+        filters={
+            "ccd_reg_source": source,
+            "agent_sync_run_id": str(run_id),
+        },
+    )
     _set_state(
         doc.name,
         agent_sync_state="Post-processing",
         agent_sync_heartbeat_at=now_datetime(),
-        agent_sync_last_result="Ingestion complete; downstream processing queued",
+        agent_sync_rows_processed=0,
+        agent_sync_last_result=(
+            "Ingestion complete; downstream processing queued "
+            f"(0 / {postprocess_total:,} Master row(s))"
+        ),
     )
     _enqueue_postprocess(
         registration=doc.name,
@@ -836,8 +849,13 @@ def finish_sync(
         full_sync=bool(cint(full_sync)),
         changed_source_keys=sorted(set(changed)),
         deleted_source_keys=sorted(set(deleted)),
+        total=postprocess_total,
     )
-    return {"queued": True, "state": "Post-processing"}
+    return {
+        "queued": True,
+        "state": "Post-processing",
+        "total": postprocess_total,
+    }
 
 
 def _renew_postprocess_lease(source_id: str, token: str, ttl: int) -> bool:
@@ -905,6 +923,7 @@ def run_postprocess_batch(
     full_sync: bool,
     changed_source_keys: list[str],
     deleted_source_keys: list[str],
+    total: int = 0,
     cursor: str = "",
     processed: int = 0,
     error_count: int = 0,
@@ -929,6 +948,17 @@ def run_postprocess_batch(
         "agent_sync_run_id": run_id,
         "name": [">", cursor or ""],
     }
+    postprocess_total = cint(total)
+    if postprocess_total <= 0:
+        # Compatibility with a queued job created before total progress was
+        # added. The composite run index keeps this one-time count bounded.
+        postprocess_total = frappe.db.count(
+            MASTER_DOCTYPE,
+            filters={
+                "ccd_reg_source": source,
+                "agent_sync_run_id": run_id,
+            },
+        )
     names = frappe.get_all(
         MASTER_DOCTYPE,
         filters=filters,
@@ -946,7 +976,8 @@ def run_postprocess_batch(
             agent_sync_heartbeat_at=now_datetime(),
             agent_sync_rows_processed=processed,
             agent_sync_last_result=(
-                f"Post-processed {processed} inserted row(s); {error_count} error(s)"
+                f"Post-processing progress: {processed:,} / "
+                f"{postprocess_total:,} Master row(s); {error_count:,} error(s)"
             ),
         )
         _enqueue_postprocess(
@@ -957,6 +988,7 @@ def run_postprocess_batch(
             full_sync=bool(full_sync),
             changed_source_keys=list(changed_source_keys or []),
             deleted_source_keys=list(deleted_source_keys or []),
+            total=postprocess_total,
             cursor=str(names[-1]),
             processed=processed,
             error_count=error_count,
@@ -964,6 +996,7 @@ def run_postprocess_batch(
         return {
             "status": "continuing",
             "processed": processed,
+            "total": postprocess_total,
             "errors": error_count,
         }
 
@@ -988,6 +1021,7 @@ def run_postprocess_batch(
             agent_sync_last_result=json.dumps(
                 {
                     "postprocessed": cint(processed),
+                    "total": postprocess_total,
                     "errors": cint(error_count),
                     "portal": portal_result,
                 },
@@ -998,6 +1032,7 @@ def run_postprocess_batch(
         return {
             "status": final_state,
             "processed": cint(processed),
+            "total": postprocess_total,
             "errors": cint(error_count),
             "portal": portal_result,
         }
