@@ -601,6 +601,26 @@ def report_reconciliation_required(session, config, reason_code, log_prefix):
     except Exception as report_error:
         write_log(f"{{log_prefix}}: could not expose reconciliation state: {{report_error}}", "WARN")
 
+def inspect_registration_target_state(session, log_prefix):
+    """Fail closed unless the generated CCD Registration target can be inspected."""
+    doctype_url = _urlquote(ccd_reg_doctype, safe="")
+    response = request_with_retry(
+        session,
+        "GET",
+        f"{{erpnext_url}}/api/resource/{{doctype_url}}",
+        log_prefix,
+        params={{"fields": '["name"]', "limit_page_length": 1}},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"central registration-target inspection failed "
+            f"(HTTP {{response.status_code}}): {{response.text[:300]}}"
+        )
+    rows = response.json().get("data")
+    if not isinstance(rows, list):
+        raise RuntimeError("central registration-target inspection returned an invalid response")
+    return {{"target_has_rows": bool(rows)}}
+
 def inspect_master_source_state(session, lease, log_prefix):
     if not lease:
         raise RuntimeError("central coordination lease is required for safe bootstrap")
@@ -973,17 +993,32 @@ def execute_step(step, prev_result):
 
             if _cache is None:
                 write_log(f"SYNC_TO_CCD_REG_BULK: no cache — running full sync")
-                clear_r = request_with_retry(
-                    sess, "POST", f"{{erpnext_url}}/api/method/agent_bulk_sync", "SYNC_TO_CCD_REG_BULK",
-                    json={{"action": "clear", "doctype": ccd_doctype}}
-                )
-                if clear_r.status_code != 200:
-                    write_log(f"SYNC_TO_CCD_REG_BULK: clear failed ({{clear_r.status_code}}): {{clear_r.text[:300]}}", "ERROR")
+                try:
+                    _target_state = inspect_registration_target_state(
+                        sess, "SYNC_TO_CCD_REG_BULK"
+                    )
+                except Exception as inspection_error:
+                    write_log(
+                        "SYNC_TO_CCD_REG_BULK: Reconciliation Required — "
+                        f"could not verify an empty target; no records changed: {{inspection_error}}",
+                        "ERROR",
+                    )
                     return prev_result
+                if _target_state.get("target_has_rows"):
+                    write_log(
+                        "SYNC_TO_CCD_REG_BULK: Reconciliation Required — "
+                        "local cache is missing but the CCD Registration target has rows; "
+                        "automatic clearing is disabled",
+                        "ERROR",
+                    )
+                    return prev_result
+                write_log(
+                    "SYNC_TO_CCD_REG_BULK: verified empty target — "
+                    "starting non-destructive full insert"
+                )
                 _progress_cache.clear()
                 _progress_ready = True
                 save_delta_cache(_cache_path, _progress_cache)
-                write_log(f"SYNC_TO_CCD_REG_BULK: cleared all existing records (bulk)")
                 total_rows = len(all_cleaned)
                 for i in range(0, total_rows, batch_size):
                     chunk = all_cleaned[i:i + batch_size]
@@ -1223,41 +1258,33 @@ def execute_step(step, prev_result):
 
             if _cache is None:
                 write_log(f"SYNC_TO_CCD_REG: no cache — running full sync")
-                all_existing = []
-                _limit = 500
-                _start = 0
                 _ccd_doctype_url = _urlquote(ccd_doctype, safe='')
-                while True:
-                    page_r = request_with_retry(
-                        sess, "GET", f"{{erpnext_url}}/api/resource/{{_ccd_doctype_url}}", "SYNC_TO_CCD_REG",
-                        params={{"limit_page_length": _limit, "limit_start": _start, "fields": '["name"]'}}
+                try:
+                    _target_state = inspect_registration_target_state(
+                        sess, "SYNC_TO_CCD_REG"
                     )
-                    if page_r.status_code != 200:
-                        errors += 1
-                        write_log(f"SYNC_TO_CCD_REG: list failed ({{page_r.status_code}}): {{page_r.text[:300]}}", "ERROR")
-                        return prev_result
-                    page_data = page_r.json().get("data", [])
-                    if not page_data:
-                        break
-                    all_existing.extend(page_data)
-                    if len(page_data) < _limit:
-                        break
-                    _start += _limit
-                for item in all_existing:
-                    delete_r = request_with_retry(
-                        sess, "DELETE", f"{{erpnext_url}}/api/resource/{{_ccd_doctype_url}}/{{_urlquote(item['name'], safe='')}}",
-                        "SYNC_TO_CCD_REG"
+                except Exception as inspection_error:
+                    write_log(
+                        "SYNC_TO_CCD_REG: Reconciliation Required — "
+                        f"could not verify an empty target; no records changed: {{inspection_error}}",
+                        "ERROR",
                     )
-                    if delete_r.status_code not in (200, 202):
-                        errors += 1
-                        write_log(f"SYNC_TO_CCD_REG: delete failed ({{delete_r.status_code}}): {{delete_r.text[:300]}}", "ERROR")
-                if errors:
-                    invalidate_delta_cache(_cache_path, "SYNC_TO_CCD_REG")
                     return prev_result
+                if _target_state.get("target_has_rows"):
+                    write_log(
+                        "SYNC_TO_CCD_REG: Reconciliation Required — "
+                        "local cache is missing but the CCD Registration target has rows; "
+                        "automatic clearing is disabled",
+                        "ERROR",
+                    )
+                    return prev_result
+                write_log(
+                    "SYNC_TO_CCD_REG: verified empty target — "
+                    "starting non-destructive full insert"
+                )
                 _progress_cache.clear()
                 _progress_ready = True
                 save_delta_cache(_cache_path, _progress_cache)
-                write_log(f"SYNC_TO_CCD_REG: cleared {{len(all_existing)}} existing record(s)")
                 for ck, (ch, crow) in client_map.items():
                     r = request_with_retry(
                         sess, "POST", f"{{erpnext_url}}/api/resource/{{_ccd_doctype_url}}", "SYNC_TO_CCD_REG",

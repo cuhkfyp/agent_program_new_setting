@@ -6,6 +6,7 @@ import pathlib
 import py_compile
 import re
 import unittest
+from urllib.parse import quote
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -125,6 +126,86 @@ class StaticContracts(unittest.TestCase):
         self.assertNotIn('sess, "DELETE"', master_sync)
         self.assertIn("inspect_master_source_state", master_sync)
         self.assertIn("Reconciliation Required", master_sync)
+
+    def test_registration_sync_bootstrap_is_non_destructive(self) -> None:
+        source = AGENT.read_text(encoding="utf-8")
+        start = source.index("# ---- SYNC_TO_CCD_REG_BULK macro ----")
+        end = source.index("# ---- SYNC_TO_CCD_MASTER_BULK macro ----", start)
+        registration_sync = source[start:end]
+        self.assertNotIn('"action": "clear"', registration_sync)
+        self.assertNotIn('sess, "DELETE"', registration_sync)
+        self.assertEqual(
+            registration_sync.count("inspect_registration_target_state"),
+            2,
+            "bulk and legacy registration paths must verify an empty target",
+        )
+        self.assertIn("verified empty target", registration_sync)
+        self.assertIn("automatic clearing is disabled", registration_sync)
+
+    def test_registration_target_inspection_detects_empty_and_populated(self) -> None:
+        script = self._generated_daemon_source()
+        tree = ast.parse(script)
+        inspector = next(
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "inspect_registration_target_state"
+        )
+
+        class Response:
+            status_code = 200
+            text = ""
+
+            def __init__(self, rows: list[dict[str, str]]) -> None:
+                self.rows = rows
+
+            def json(self) -> dict[str, list[dict[str, str]]]:
+                return {"data": self.rows}
+
+        response = Response([])
+        calls: list[tuple[str, str, dict[str, object]]] = []
+
+        def request_with_retry(
+            _session: object,
+            method: str,
+            url: str,
+            _log_prefix: str,
+            **kwargs: object,
+        ) -> Response:
+            calls.append((method, url, kwargs))
+            return response
+
+        namespace: dict[str, object] = {
+            "_urlquote": quote,
+            "ccd_reg_doctype": "CCD-REG-HOST_DB",
+            "erpnext_url": "https://erp.example.org",
+            "request_with_retry": request_with_retry,
+        }
+        exec(
+            compile(
+                ast.Module(body=[inspector], type_ignores=[]),
+                "<generated-registration-inspector>",
+                "exec",
+            ),
+            namespace,
+        )
+        inspect_target = namespace["inspect_registration_target_state"]
+
+        self.assertEqual(
+            inspect_target(object(), "TEST"),
+            {"target_has_rows": False},
+        )
+        response.rows = [{"name": "ROW-1"}]
+        self.assertEqual(
+            inspect_target(object(), "TEST"),
+            {"target_has_rows": True},
+        )
+        self.assertEqual(calls[0][0], "GET")
+        self.assertEqual(
+            calls[0][1],
+            "https://erp.example.org/api/resource/CCD-REG-HOST_DB",
+        )
+        self.assertEqual(calls[0][2]["params"]["limit_page_length"], 1)
 
     def test_retirement_service_is_not_coupled_to_sync_api(self) -> None:
         source = API.read_text(encoding="utf-8")

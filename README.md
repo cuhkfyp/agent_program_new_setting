@@ -29,6 +29,10 @@ Manager changes that registration to `Fast Bulk Insert`.
   bulk macro takes the per-source central lease, verifies that the source is
   empty, and then performs inserts only. A populated source is shown as
   `Reconciliation Required` in the registration's Agent Sync tab.
+- A missing CCD Registration cache also never authorizes a clear. Both its
+  bulk and legacy paths verify that the generated target is empty before a
+  full insert. A populated target fails closed as `Reconciliation Required`,
+  preserving the governed deletion-reason and identity-retirement controls.
 - Agent delta detection never physically deletes CCD Master rows. A removed
   source key fails closed as `Reconciliation Required`; governed registration
   cancellation and identity retirement remain the authority for source
