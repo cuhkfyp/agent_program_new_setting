@@ -14,6 +14,24 @@ AGENT_TEMPLATE_ASSETS = {
     "Windows - Central Sync": "setup_windows.bat",
     "Windows - Central Sync (No PowerShell)": "setup_windows_no_powershell.bat",
 }
+AGENT_TEMPLATE_GUARD_EVENTS = {
+    "CCD Central Agent Template Before Save": "Before Save",
+    "CCD Central Agent Template Before Submit": "Before Submit",
+}
+AGENT_TEMPLATE_GUARD_SCRIPT = """central_agent_templates = (
+    "Windows - Central Sync",
+    "Windows - Central Sync (No PowerShell)",
+)
+
+if doc.get("agent_os") in central_agent_templates:
+    central_template = frappe.get_doc(
+        "CCD Agent OS Batch Template", doc.get("agent_os")
+    )
+    central_template_content = central_template.get("os_template") or ""
+    if not central_template_content:
+        frappe.throw("The selected Central Sync agent template is empty")
+    doc.agent_installation = central_template_content
+"""
 
 
 SETTINGS_FIELDS: list[dict[str, Any]] = [
@@ -376,6 +394,63 @@ def _install_agent_templates() -> list[dict[str, Any]]:
     return results
 
 
+def _install_agent_template_guards() -> list[dict[str, Any]]:
+    """Refresh only namespaced Central Sync installers during document saves."""
+    results = []
+    for script_name, event in AGENT_TEMPLATE_GUARD_EVENTS.items():
+        values = {
+            "script_type": "DocType Event",
+            "reference_doctype": "CCD Registration",
+            "doctype_event": event,
+            "script": AGENT_TEMPLATE_GUARD_SCRIPT,
+            "disabled": 0,
+        }
+        created = not frappe.db.exists("Server Script", script_name)
+        if created:
+            frappe.get_doc(
+                {"doctype": "Server Script", "name": script_name, **values}
+            ).insert(ignore_permissions=True)
+            changed = True
+        else:
+            server_script = frappe.get_doc("Server Script", script_name)
+            changed = any(server_script.get(key) != value for key, value in values.items())
+            if changed:
+                server_script.update(values)
+                server_script.save(ignore_permissions=True)
+        results.append({"name": script_name, "created": created, "updated": changed})
+    return results
+
+
+def _refresh_active_agent_installations() -> list[str]:
+    """Repair stale copied installers without touching legacy OS selections."""
+    templates = {
+        name: frappe.db.get_value(AGENT_TEMPLATE_DOCTYPE, name, "os_template") or ""
+        for name in AGENT_TEMPLATE_ASSETS
+    }
+    registrations = frappe.get_all(
+        "CCD Registration",
+        filters={
+            "docstatus": ["in", [0, 1]],
+            "agent_os": ["in", list(AGENT_TEMPLATE_ASSETS)],
+        },
+        fields=["name", "agent_os", "agent_installation"],
+        limit_page_length=0,
+    )
+    updated = []
+    for registration in registrations:
+        expected = templates.get(registration.agent_os, "")
+        if expected and str(registration.agent_installation or "") != expected:
+            frappe.db.set_value(
+                "CCD Registration",
+                registration.name,
+                "agent_installation",
+                expected,
+                update_modified=False,
+            )
+            updated.append(registration.name)
+    return updated
+
+
 def _add_indexes() -> list[str]:
     indexes = []
     index_name = "idx_ccd_master_agent_sync_run"
@@ -399,6 +474,8 @@ def install() -> dict[str, Any]:
     create_custom_fields(_custom_fields(), update=True)
     _initialize_defaults()
     agent_templates = _install_agent_templates()
+    agent_template_guards = _install_agent_template_guards()
+    refreshed_agent_installations = _refresh_active_agent_installations()
     indexes = _add_indexes()
     frappe.clear_cache(doctype="CCD Registration")
     frappe.clear_cache(doctype="CCD Master")
@@ -412,6 +489,8 @@ def install() -> dict[str, Any]:
             "CCD Master-agent_sync_run_id",
         ],
         "agent_templates": agent_templates,
+        "agent_template_guards": agent_template_guards,
+        "refreshed_agent_installations": refreshed_agent_installations,
         "indexes_added": indexes,
         "enabled": bool(frappe.db.get_single_value(SETTINGS_DOCTYPE, "enabled")),
     }

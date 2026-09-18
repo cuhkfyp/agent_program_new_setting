@@ -37,6 +37,10 @@ Manager changes that registration to `Fast Bulk Insert`.
   are sent as database `NULL`, preventing strict-SQL failures during CCD-REG
   updates and CCD Master ingestion. Other field types retain their established
   conversion behavior.
+- The two namespaced Central Sync OS selections refresh their copied installer
+  before draft saves and submission. Runtime installation also repairs stale
+  copies on active/draft Central Sync registrations without altering legacy or
+  colleague-owned OS templates.
 
 ## Repository layout
 

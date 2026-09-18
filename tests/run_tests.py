@@ -211,6 +211,18 @@ class StaticContracts(unittest.TestCase):
         self.assertIn('"Windows - Central Sync (No PowerShell)"', setup)
         self.assertNotIn('"Windows 11":', setup)
 
+    def test_central_installers_are_refreshed_without_legacy_templates(self) -> None:
+        setup = SETUP.read_text(encoding="utf-8")
+        self.assertIn('"CCD Central Agent Template Before Save": "Before Save"', setup)
+        self.assertIn(
+            '"CCD Central Agent Template Before Submit": "Before Submit"',
+            setup,
+        )
+        self.assertIn("doc.agent_installation = central_template_content", setup)
+        self.assertIn('"agent_os": ["in", list(AGENT_TEMPLATE_ASSETS)]', setup)
+        self.assertIn('"docstatus": ["in", [0, 1]]', setup)
+        self.assertIn("update_modified=False", setup)
+
 
 if __name__ == "__main__":
     unittest.main()
