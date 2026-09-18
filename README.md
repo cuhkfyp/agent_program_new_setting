@@ -36,6 +36,10 @@ Manager changes that registration to `Fast Bulk Insert`.
   bulk and legacy paths verify that the generated target is empty before a
   full insert. A populated target fails closed as `Reconciliation Required`,
   preserving the governed deletion-reason and identity-retirement controls.
+- Job actions are fail-closed within each registration/database daemon. If the
+  CCD Registration action logs an error, the remaining actions are skipped, so
+  CCD Master cannot continue for that database during the failed cycle. Other
+  databases on the same host retain their independent jobs and locks.
 - Agent delta detection never physically deletes CCD Master rows. A removed
   source key fails closed as `Reconciliation Required`; governed registration
   cancellation and identity retirement remain the authority for source

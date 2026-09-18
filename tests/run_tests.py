@@ -89,6 +89,48 @@ class StaticContracts(unittest.TestCase):
         script = self._generated_daemon_source()
         compile(script, "<generated-daemon>", "exec")
 
+    def test_pipeline_stops_master_after_registration_error(self) -> None:
+        script = self._generated_daemon_source()
+        tree = ast.parse(script)
+        pipeline_error = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "PipelineStepFailed"
+        )
+        pipeline = next(
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "execute_pipeline"
+        )
+        calls: list[str] = []
+        namespace: dict[str, object] = {
+            "actions": ["SYNC_TO_CCD_REG_BULK", "SYNC_TO_CCD_MASTER_BULK"],
+            "_pipeline_step_failed": False,
+            "write_log": lambda *_args, **_kwargs: None,
+        }
+
+        def execute_step(step: str, previous: object) -> object:
+            calls.append(step)
+            if step == "SYNC_TO_CCD_REG_BULK":
+                namespace["_pipeline_step_failed"] = True
+            return previous
+
+        namespace["execute_step"] = execute_step
+        exec(
+            compile(
+                ast.Module(body=[pipeline_error, pipeline], type_ignores=[]),
+                "<generated-fail-closed-pipeline>",
+                "exec",
+            ),
+            namespace,
+        )
+
+        with self.assertRaises(namespace["PipelineStepFailed"]):
+            namespace["execute_pipeline"]()
+        self.assertEqual(calls, ["SYNC_TO_CCD_REG_BULK"])
+
     def test_blank_temporal_values_are_database_nulls(self) -> None:
         script = self._generated_daemon_source()
         tree = ast.parse(script)

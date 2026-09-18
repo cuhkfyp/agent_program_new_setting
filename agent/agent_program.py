@@ -232,7 +232,15 @@ source_id = "{source_id_escaped}" or registration_id
 ccd_reg_doctype = "{ccd_reg_doctype_escaped}" or f"CCD-REG-{{registration_id}}"
 _hostname = physical_hostname
 
+_pipeline_step_failed = False
+
+class PipelineStepFailed(RuntimeError):
+    """Stop later actions when the current action logged a hard failure."""
+
 def write_log(msg, level="INFO"):
+    global _pipeline_step_failed
+    if str(level).upper() in {{"ERROR", "FATAL"}}:
+        _pipeline_step_failed = True
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     entry = f"[{{ts}}] [{{level}}] [{{physical_hostname}}] [{{source_id}}] [{{job_name}}] {{msg}}"
     try:
@@ -2266,12 +2274,20 @@ def execute_step(step, prev_result):
         return str(e)
 
 def execute_pipeline():
-    """Run all actions sequentially; each step receives the previous result."""
+    """Run actions sequentially and never advance after a failed action."""
+    global _pipeline_step_failed
     result = None
     total = len(actions)
     for idx, step in enumerate(actions, 1):
+        _pipeline_step_failed = False
         write_log(f"Step {{idx}}/{{total}}: {{step}}")
         result = execute_step(step, result)
+        if _pipeline_step_failed:
+            remaining = total - idx
+            raise PipelineStepFailed(
+                f"Step {{idx}}/{{total}} failed ({{step}}); "
+                f"{{remaining}} remaining step(s) skipped"
+            )
         write_log(f"Step {{idx}}/{{total}} completed")
     return result
 
