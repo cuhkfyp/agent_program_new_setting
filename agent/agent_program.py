@@ -3085,49 +3085,59 @@ def handle_ghost(data):
 
 
 
+def run_agent():
+    """Run the foreground agent and report startup/runtime failures to Windows."""
+    if not login_to_erpnext():
+        print("\n❌ ERROR: ERPNext authentication failed.")
+        return 1
+
+    print("Connecting to Socket server...")
+    cookie_string = "; ".join([f"{k}={v}" for k, v in http_session.cookies.items()])
+
+    try:
+        sio.connect(
+            ERPNEXT_URL,
+            namespaces=[NAMESPACE],
+            transports=['websocket'],
+            wait_timeout=10,            # default is 1s — too short for external clients (network + server session validation > 1s)
+            headers={
+                'Cookie': cookie_string,
+                'X-Frappe-Site-Name': CCD_SITE_NAME,
+            }
+        )
+
+        print("🎧 Agent is locked in. Waiting for broadcasts... new12345678901")
+
+        hostname = socket.gethostname()
+        print(f"\n📌 Hostname: {hostname}")
+        print(f"📌 Discovering CCD Registration records for physical_hostname={hostname}")
+
+        registration_docs = discover_ccd_registration_docs(hostname)
+        if registration_docs:
+            print(f"\n🚀 Found {len(registration_docs)} CCD Registration record(s) for {hostname}")
+            for registration_doc in registration_docs:
+                process_ccd_registration_doc(registration_doc, hostname)
+        else:
+            print(f"❌ No CCD Registration found for physical_hostname or legacy hostname: {hostname}")
+
+        while sio.connected:
+            time.sleep(0.4)
+
+        print("\n❌ ERROR: Socket.IO disconnected after its reconnection attempts were exhausted.")
+        return 1
+    except KeyboardInterrupt:
+        print("\nAgent terminated.")
+        return 0
+    except Exception as e:
+        print(f"\n❌ ERROR: {e}")
+        return 1
+    finally:
+        daemon_stop_event.set()
+        if daemon_thread and daemon_thread.is_alive():
+            daemon_thread.join(timeout=2)
+        if sio.connected:
+            sio.disconnect()
+
+
 if __name__ == "__main__":
-    if login_to_erpnext():
-        print("Connecting to Socket server...")
-
-        cookie_string = "; ".join([f"{k}={v}" for k, v in http_session.cookies.items()])
-
-        try:
-            sio.connect(
-                ERPNEXT_URL,
-                namespaces=[NAMESPACE],
-                transports=['websocket'],
-                wait_timeout=10,            # default is 1s — too short for external clients (network + server session validation > 1s)
-                headers={
-                    'Cookie': cookie_string,
-                    'X-Frappe-Site-Name': CCD_SITE_NAME,
-                }
-            )
-
-            print("🎧 Agent is locked in. Waiting for broadcasts... new12345678901")
-
-            hostname = socket.gethostname()
-            print(f"\n📌 Hostname: {hostname}")
-            print(f"📌 Discovering CCD Registration records for physical_hostname={hostname}")
-
-            registration_docs = discover_ccd_registration_docs(hostname)
-            if registration_docs:
-                print(f"\n🚀 Found {len(registration_docs)} CCD Registration record(s) for {hostname}")
-                for registration_doc in registration_docs:
-                    process_ccd_registration_doc(registration_doc, hostname)
-            else:
-                print(f"❌ No CCD Registration found for physical_hostname or legacy hostname: {hostname}")
-
-            #sio.wait()
-            while sio.connected:
-                time.sleep(0.4)
-
-        except Exception as e:
-            print(f"\n❌ ERROR: {e}")
-        except KeyboardInterrupt:
-            print("\nAgent terminated.")
-        finally:
-            daemon_stop_event.set()
-            if daemon_thread and daemon_thread.is_alive():
-                daemon_thread.join(timeout=2)
-            if sio.connected:
-                sio.disconnect()
+    sys.exit(run_agent())

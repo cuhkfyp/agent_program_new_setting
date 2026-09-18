@@ -55,6 +55,15 @@ class StaticContracts(unittest.TestCase):
         for path in (AGENT, API, SETUP):
             py_compile.compile(str(path), doraise=True)
 
+    def test_agent_propagates_foreground_failures_to_windows(self) -> None:
+        source = AGENT.read_text(encoding="utf-8")
+        self.assertIn("def run_agent():", source)
+        self.assertIn('sys.exit(run_agent())', source)
+        self.assertIn(
+            'ERROR: Socket.IO disconnected after its reconnection attempts were exhausted.',
+            source,
+        )
+
     def test_source_identity_is_not_suffix_trimmed(self) -> None:
         source = AGENT.read_text(encoding="utf-8")
         self.assertNotIn("def trim_suffix", source)
