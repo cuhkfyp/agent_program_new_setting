@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from textwrap import indent
 from typing import Any
 
 import frappe
@@ -31,6 +32,124 @@ if doc.get("agent_os") in central_agent_templates:
     if not central_template_content:
         frappe.throw("The selected Central Sync agent template is empty")
     doc.agent_installation = central_template_content
+"""
+
+REGISTRATION_VALIDATION_BODY = """physical_hostname = str(doc.get("physical_hostname") or "").strip()
+database_name = str(doc.get("db_database") or "").strip()
+table_name = str(doc.get("ccd_table") or "").strip()
+register_name = str(doc.get("ccd_reg_doctype") or "").strip()
+
+if not physical_hostname:
+    frappe.throw("Physical Hostname is required before saving CCD Registration")
+
+if not register_name.startswith("CCD-REG-"):
+    frappe.throw("CCD Register Name must start with CCD-REG-")
+
+register_suffix = register_name[len("CCD-REG-"):]
+allowed_characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+invalid_character = ""
+for character in register_suffix:
+    if character not in allowed_characters:
+        invalid_character = character
+        break
+if not register_suffix or invalid_character:
+    frappe.throw(
+        "CCD Register Name may contain only letters, numbers, underscore, and hyphen after CCD-REG-"
+    )
+
+table_component = table_name.rsplit(".", 1)[-1]
+if table_name == "*** Customize ***":
+    table_component = ""
+
+register_name_lower = register_name.lower()
+source_components = (
+    ("Physical Hostname", physical_hostname),
+    ("Database name", database_name),
+    ("CCD table", table_component),
+)
+matched_components = []
+for label, value in source_components:
+    if value and value.lower() in register_name_lower:
+        matched_components.append(label)
+
+if len(matched_components) < 2:
+    matched_text = ", ".join(matched_components) or "none"
+    frappe.throw(
+        "CCD Register Name must contain at least two source components: "
+        "Physical Hostname, Database name, and CCD table. "
+        "Matched components: " + matched_text
+    )
+"""
+
+REGISTRATION_VALIDATION_SERVER_SCRIPTS = {
+    "CCD Registration Routing Before Save": {
+        "doctype_event": "Before Save",
+        "script": "if doc.docstatus == 0:\n" + indent(REGISTRATION_VALIDATION_BODY, "    "),
+    },
+    "CCD Registration Routing Before Submit": {
+        "doctype_event": "Before Submit",
+        "script": REGISTRATION_VALIDATION_BODY,
+    },
+}
+
+REGISTRATION_VALIDATION_CLIENT_SCRIPT_NAME = "CCD Registration Routing Validation"
+REGISTRATION_VALIDATION_CLIENT_SCRIPT = r"""function ccd_registration_validate_routing(frm) {
+    if (frm.doc.docstatus !== 0) {
+        return;
+    }
+
+    const physical_hostname = String(frm.doc.physical_hostname || '').trim();
+    const database_name = String(frm.doc.db_database || '').trim();
+    const table_name = String(frm.doc.ccd_table || '').trim();
+    const register_name = String(frm.doc.ccd_reg_doctype || '').trim();
+
+    if (!physical_hostname) {
+        frappe.throw(__('Physical Hostname is required before saving CCD Registration'));
+    }
+    if (!register_name.startsWith('CCD-REG-')) {
+        frappe.throw(__('CCD Register Name must start with CCD-REG-'));
+    }
+
+    const register_suffix = register_name.slice('CCD-REG-'.length);
+    if (!register_suffix || !/^[A-Za-z0-9_-]+$/.test(register_suffix)) {
+        frappe.throw(__('CCD Register Name may contain only letters, numbers, underscore, and hyphen after CCD-REG-'));
+    }
+
+    let table_component = table_name.split('.').pop() || '';
+    if (table_name === '*** Customize ***') {
+        table_component = '';
+    }
+    const register_name_lower = register_name.toLowerCase();
+    const source_components = [
+        ['Physical Hostname', physical_hostname],
+        ['Database name', database_name],
+        ['CCD table', table_component]
+    ];
+    const matched_components = source_components
+        .filter((entry) => entry[1] && register_name_lower.includes(entry[1].toLowerCase()))
+        .map((entry) => entry[0]);
+
+    if (matched_components.length < 2) {
+        frappe.throw(__(
+            'CCD Register Name must contain at least two source components: Physical Hostname, Database name, and CCD table. Matched components: {0}',
+            [matched_components.join(', ') || 'none']
+        ));
+    }
+}
+
+frappe.ui.form.on('CCD Registration', {
+    setup(frm) {
+        frm.set_df_property('physical_hostname', 'reqd', 1);
+        frm.set_df_property('ccd_reg_doctype', 'reqd', 1);
+    },
+    refresh(frm) {
+        frm.set_df_property('physical_hostname', 'reqd', 1);
+        frm.set_df_property('ccd_reg_doctype', 'reqd', 1);
+    },
+    validate(frm) {
+        ccd_registration_validate_routing(frm);
+    }
+});
 """
 
 
@@ -421,6 +540,75 @@ def _install_agent_template_guards() -> list[dict[str, Any]]:
     return results
 
 
+def _install_registration_validation_scripts() -> dict[str, Any]:
+    """Install isolated client/server guards for registration routing fields."""
+    server_results = []
+    for script_name, definition in REGISTRATION_VALIDATION_SERVER_SCRIPTS.items():
+        values = {
+            "script_type": "DocType Event",
+            "reference_doctype": "CCD Registration",
+            "doctype_event": definition["doctype_event"],
+            "script": definition["script"],
+            "disabled": 0,
+        }
+        created = not frappe.db.exists("Server Script", script_name)
+        if created:
+            frappe.get_doc(
+                {"doctype": "Server Script", "name": script_name, **values}
+            ).insert(ignore_permissions=True)
+            changed = True
+        else:
+            server_script = frappe.get_doc("Server Script", script_name)
+            changed = any(
+                server_script.get(key) != value for key, value in values.items()
+            )
+            if changed:
+                server_script.update(values)
+                server_script.save(ignore_permissions=True)
+        server_results.append(
+            {"name": script_name, "created": created, "updated": changed}
+        )
+
+    client_values = {
+        "dt": "CCD Registration",
+        "view": "Form",
+        "enabled": 1,
+        "script": REGISTRATION_VALIDATION_CLIENT_SCRIPT,
+    }
+    client_created = not frappe.db.exists(
+        "Client Script", REGISTRATION_VALIDATION_CLIENT_SCRIPT_NAME
+    )
+    if client_created:
+        frappe.get_doc(
+            {
+                "doctype": "Client Script",
+                "name": REGISTRATION_VALIDATION_CLIENT_SCRIPT_NAME,
+                **client_values,
+            }
+        ).insert(ignore_permissions=True)
+        client_changed = True
+    else:
+        client_script = frappe.get_doc(
+            "Client Script", REGISTRATION_VALIDATION_CLIENT_SCRIPT_NAME
+        )
+        client_changed = any(
+            client_script.get(key) != value
+            for key, value in client_values.items()
+        )
+        if client_changed:
+            client_script.update(client_values)
+            client_script.save(ignore_permissions=True)
+
+    return {
+        "server_scripts": server_results,
+        "client_script": {
+            "name": REGISTRATION_VALIDATION_CLIENT_SCRIPT_NAME,
+            "created": client_created,
+            "updated": client_changed,
+        },
+    }
+
+
 def _refresh_active_agent_installations() -> list[str]:
     """Repair stale copied installers without touching legacy OS selections."""
     templates = {
@@ -475,6 +663,7 @@ def install() -> dict[str, Any]:
     _initialize_defaults()
     agent_templates = _install_agent_templates()
     agent_template_guards = _install_agent_template_guards()
+    registration_validation = _install_registration_validation_scripts()
     refreshed_agent_installations = _refresh_active_agent_installations()
     indexes = _add_indexes()
     frappe.clear_cache(doctype="CCD Registration")
@@ -490,6 +679,7 @@ def install() -> dict[str, Any]:
         ],
         "agent_templates": agent_templates,
         "agent_template_guards": agent_template_guards,
+        "registration_validation": registration_validation,
         "refreshed_agent_installations": refreshed_agent_installations,
         "indexes_added": indexes,
         "enabled": bool(frappe.db.get_single_value(SETTINGS_DOCTYPE, "enabled")),

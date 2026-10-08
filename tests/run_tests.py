@@ -423,6 +423,16 @@ class StaticContracts(unittest.TestCase):
         self.assertIn('"docstatus": ["in", [0, 1]]', setup)
         self.assertIn("update_modified=False", setup)
 
+    def test_registration_routing_validation_is_client_and_server_enforced(self) -> None:
+        setup = SETUP.read_text(encoding="utf-8")
+        self.assertIn("CCD Registration Routing Before Save", setup)
+        self.assertIn("CCD Registration Routing Before Submit", setup)
+        self.assertIn("CCD Registration Routing Validation", setup)
+        self.assertIn("Physical Hostname is required", setup)
+        self.assertIn("CCD Register Name must start with CCD-REG-", setup)
+        self.assertIn("must contain at least two source components", setup)
+        self.assertIn("frm.set_df_property('physical_hostname', 'reqd', 1)", setup)
+
 
 if __name__ == "__main__":
     unittest.main()
