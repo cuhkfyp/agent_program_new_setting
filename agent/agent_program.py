@@ -11,7 +11,7 @@ import threading
 import smtplib
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
-from urllib.parse import quote as urlquote
+from urllib.parse import quote as urlquote, urlsplit, urlunsplit
 import socketio
 import urllib3
 
@@ -24,6 +24,23 @@ daemon_stop_event = threading.Event()
 daemon_thread = None
 _base_dir = os.path.dirname(os.path.abspath(__file__))
 _log_dir = os.path.join(_base_dir, 'daemon_logs')
+
+
+def normalize_erpnext_base_url(value):
+    """Return the configured Frappe site base, not a Desk/API page URL."""
+    raw_value = (value or "").strip().rstrip("/")
+    if not raw_value:
+        return ""
+
+    parsed = urlsplit(raw_value)
+    path = (parsed.path or "").rstrip("/")
+    first_segment = path.lstrip("/").split("/", 1)[0].lower()
+    if first_segment in {"app", "desk", "login", "api"}:
+        path = ""
+
+    return urlunsplit(
+        (parsed.scheme.lower(), parsed.netloc, path, "", "")
+    ).rstrip("/")
 
 def file_reader_daemon(filepath, interval=5):
     """Daemon:1 — reads and prints file contents every `interval` seconds."""
@@ -2710,10 +2727,15 @@ def _safe_set_keyring_password(service, username, password):
         print(f"WARNING: Could not store keyring secret {service}/{username}: {e}")
         return False
 
-ERPNEXT_URL = (
+_configured_erpnext_url = (
     os.environ.get("CCD_ERPNEXT_URL", "")
     or _safe_get_keyring_password("ccd_agent", "erpnext_url", "")
 ).strip().rstrip("/")
+ERPNEXT_URL = normalize_erpnext_base_url(_configured_erpnext_url)
+if ERPNEXT_URL and ERPNEXT_URL != _configured_erpnext_url:
+    print(f"Corrected ERPNext page URL to site base: {ERPNEXT_URL}")
+    if not os.environ.get("CCD_ERPNEXT_URL", "").strip():
+        _safe_set_keyring_password("ccd_agent", "erpnext_url", ERPNEXT_URL)
 ERPNEXT_USER = _safe_get_keyring_password(
     "ccd_agent", "erpnext_user", os.environ.get("CCD_ERPNEXT_USER", "")
 )
@@ -2743,17 +2765,79 @@ http_session.verify = True
 
 def login_to_erpnext():
     print("Authenticating...")
-    response = http_session.post(f"{ERPNEXT_URL}/api/method/login", data={"usr": ERPNEXT_USER, "pwd": ERPNEXT_PASS})
-    if response.status_code == 200:
+    try:
+        response = http_session.post(
+            f"{ERPNEXT_URL}/api/method/login",
+            data={"usr": ERPNEXT_USER, "pwd": ERPNEXT_PASS},
+            allow_redirects=False,
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        print(f"❌ ERPNext login request failed: {exc}")
+        return False
+
+    if response.is_redirect:
+        print(
+            "❌ ERPNext login was redirected instead of authenticated. "
+            "Check that ERPNext URL is the site base (for example, "
+            "https://server.example), not a /app/... browser page."
+        )
+        return False
+
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError):
+        payload = None
+
+    if (
+        response.status_code == 200
+        and isinstance(payload, dict)
+        and payload.get("message") == "Logged In"
+    ):
         print("✅ Login successful! Cookies secured.")
         return True
+
+    content_type = response.headers.get("Content-Type", "unknown").split(";", 1)[0]
+    print(
+        f"❌ ERPNext authentication failed: HTTP {response.status_code}; "
+        f"response type {content_type}."
+    )
     return False
+
+
+def _response_json_object(response, context):
+    """Decode one JSON API response or raise a useful, secret-safe error."""
+    if response.is_redirect:
+        raise RuntimeError(
+            f"{context} was redirected (HTTP {response.status_code}). "
+            "ERPNext URL must be the site base, not a /app/... browser page."
+        )
+    if response.status_code != 200:
+        raise RuntimeError(f"{context} failed with HTTP {response.status_code}.")
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError) as exc:
+        content_type = response.headers.get("Content-Type", "unknown").split(";", 1)[0]
+        raise RuntimeError(
+            f"{context} returned a non-JSON response "
+            f"(HTTP {response.status_code}, type {content_type}, "
+            f"{len(response.content)} bytes)."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{context} returned an invalid JSON payload.")
+    return payload
 
 def fetch_ccd_registration_doc(docname):
     """Fetch one CCD Registration document by registration id/docname."""
-    response = http_session.get(f"{ERPNEXT_URL}/api/resource/CCD Registration/{urlquote(docname, safe='')}")
+    response = http_session.get(
+        f"{ERPNEXT_URL}/api/resource/CCD Registration/{urlquote(docname, safe='')}",
+        allow_redirects=False,
+        timeout=30,
+    )
     if response.status_code == 200:
-        return response.json().get("data", {})
+        return _response_json_object(
+            response, f"CCD Registration {docname} request"
+        ).get("data", {})
     print(f"❌ Failed to fetch CCD Registration {docname}: {response.status_code} {response.text}")
     return None
 
@@ -2782,9 +2866,17 @@ def discover_ccd_registration_docs(physical_hostname):
         "fields": json.dumps(["name"]),
         "limit_page_length": 500,
     }
-    response = http_session.get(f"{ERPNEXT_URL}/api/resource/CCD Registration", params=params)
+    response = http_session.get(
+        f"{ERPNEXT_URL}/api/resource/CCD Registration",
+        params=params,
+        allow_redirects=False,
+        timeout=30,
+    )
     if response.status_code == 200:
-        for row in response.json().get("data", []):
+        payload = _response_json_object(
+            response, "CCD Registration discovery request"
+        )
+        for row in payload.get("data", []):
             docname = row.get("name")
             if docname:
                 discovered_names.append(docname)

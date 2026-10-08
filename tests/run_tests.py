@@ -23,6 +23,29 @@ REQUIREMENTS = ROOT / "agent" / "requirements.txt"
 
 
 class StaticContracts(unittest.TestCase):
+    def _agent_function(self, function_name: str):
+        tree = ast.parse(AGENT.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == function_name
+        )
+        namespace: dict[str, object] = {}
+        if function_name == "normalize_erpnext_base_url":
+            from urllib.parse import urlsplit, urlunsplit
+
+            namespace.update(urlsplit=urlsplit, urlunsplit=urlunsplit)
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                str(AGENT),
+                "exec",
+            ),
+            namespace,
+        )
+        return namespace[function_name]
+
     def _generated_daemon_source(self) -> str:
         tree = ast.parse(AGENT.read_text(encoding="utf-8"))
         builder = next(
@@ -63,6 +86,34 @@ class StaticContracts(unittest.TestCase):
             'ERROR: Socket.IO disconnected after its reconnection attempts were exhausted.',
             source,
         )
+
+    def test_browser_page_url_is_normalized_to_frappe_site_base(self) -> None:
+        normalize = self._agent_function("normalize_erpnext_base_url")
+        self.assertEqual(
+            normalize("https://erp.example.org/app/home"),
+            "https://erp.example.org",
+        )
+        self.assertEqual(
+            normalize("https://erp.example.org/app/ccd-registration?view=list"),
+            "https://erp.example.org",
+        )
+        self.assertEqual(
+            normalize("https://erp.example.org/frappe-site/"),
+            "https://erp.example.org/frappe-site",
+        )
+
+    def test_login_rejects_redirected_html_as_success(self) -> None:
+        source = AGENT.read_text(encoding="utf-8")
+        login_start = source.index("def login_to_erpnext():")
+        login_end = source.index("def _response_json_object", login_start)
+        login_source = source[login_start:login_end]
+        self.assertIn("allow_redirects=False", login_source)
+        self.assertIn('payload.get("message") == "Logged In"', login_source)
+
+    def test_registration_discovery_reports_non_json_responses(self) -> None:
+        source = AGENT.read_text(encoding="utf-8")
+        self.assertIn("def _response_json_object", source)
+        self.assertIn("returned a non-JSON response", source)
 
     def test_fast_resume_uses_idempotent_batch_confirmation(self) -> None:
         source = AGENT.read_text(encoding="utf-8")

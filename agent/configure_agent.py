@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import keyring
 
@@ -24,7 +24,13 @@ def _validate_url(value: str) -> str:
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("ERPNext URL must include http:// or https:// and a host")
-    return value
+    path = (parsed.path or "").rstrip("/")
+    first_segment = path.lstrip("/").split("/", 1)[0].lower()
+    if first_segment in {"app", "desk", "login", "api"}:
+        path = ""
+    return urlunparse(
+        (parsed.scheme.lower(), parsed.netloc, path, "", "", "")
+    ).rstrip("/")
 
 
 def configure(
