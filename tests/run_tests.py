@@ -211,6 +211,65 @@ class StaticContracts(unittest.TestCase):
             namespace["execute_pipeline"]()
         self.assertEqual(calls, ["SYNC_TO_CCD_REG_BULK"])
 
+    def test_registration_retry_confirmation_requires_exact_values(self) -> None:
+        script = self._generated_daemon_source()
+        tree = ast.parse(script)
+        function_names = {
+            "normalize_registration_compare_value",
+            "registration_rows_match",
+        }
+        functions = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in function_names
+        ]
+        namespace: dict[str, object] = {}
+        exec(
+            compile(
+                ast.Module(body=functions, type_ignores=[]),
+                "<generated-registration-retry-comparison>",
+                "exec",
+            ),
+            namespace,
+        )
+        rows_match = namespace["registration_rows_match"]
+        fieldtypes = {
+            "Enabled": "Check",
+            "CreatedAt": "Datetime",
+            "ContactAddress": "Small Text",
+        }
+        expected = {
+            "ccd_source_key": "ROW-1",
+            "enabled": "0",
+            "createdat": "2026-10-09 12:00:00",
+            "contactaddress": "Address A",
+        }
+        stored = {
+            "ccd_source_key": "ROW-1",
+            "enabled": False,
+            "createdat": "2026-10-09T12:00:00",
+            "contactaddress": "Address A",
+        }
+        self.assertTrue(rows_match(expected, stored, fieldtypes))
+        stored["contactaddress"] = "Address B"
+        self.assertFalse(rows_match(expected, stored, fieldtypes))
+
+    def test_registration_partial_batches_remain_fail_closed(self) -> None:
+        source = AGENT.read_text(encoding="utf-8")
+        start = source.index("# ---- SYNC_TO_CCD_REG_BULK macro ----")
+        end = source.index("# ---- SYNC_TO_CCD_REG macro ----", start)
+        registration_sync = source[start:end]
+        self.assertIn("def reconcile_registration_rows", registration_sync)
+        self.assertIn("registration_rows_match", registration_sync)
+        self.assertIn("errors += unresolved_count", registration_sync)
+        self.assertIn("CCD Master is blocked for this source", registration_sync)
+        self.assertIn("inspect_registration_target_count", registration_sync)
+        self.assertIn("target_count == len(client_map)", registration_sync)
+        self.assertIn("duplicate_source_keys", registration_sync)
+        self.assertIn("mapping failed; no CCD Registration rows changed", registration_sync)
+        self.assertNotIn("errors += len(_berrs)", registration_sync)
+
     def test_blank_temporal_values_are_database_nulls(self) -> None:
         script = self._generated_daemon_source()
         tree = ast.parse(script)
@@ -338,6 +397,62 @@ class StaticContracts(unittest.TestCase):
             "https://erp.example.org/api/resource/CCD-REG-HOST_DB",
         )
         self.assertEqual(calls[0][2]["params"]["limit_page_length"], 1)
+
+    def test_registration_target_count_gate_uses_central_count(self) -> None:
+        script = self._generated_daemon_source()
+        tree = ast.parse(script)
+        inspector = next(
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "inspect_registration_target_count"
+        )
+
+        class Response:
+            status_code = 200
+            text = ""
+
+            def json(self) -> dict[str, int]:
+                return {"message": 304}
+
+        calls: list[tuple[str, str, dict[str, object]]] = []
+
+        def request_with_retry(
+            _session: object,
+            method: str,
+            url: str,
+            _log_prefix: str,
+            **kwargs: object,
+        ) -> Response:
+            calls.append((method, url, kwargs))
+            return Response()
+
+        namespace: dict[str, object] = {
+            "ccd_reg_doctype": "CCD-REG-HOST_DB_TABLE",
+            "erpnext_url": "https://erp.example.org",
+            "request_with_retry": request_with_retry,
+        }
+        exec(
+            compile(
+                ast.Module(body=[inspector], type_ignores=[]),
+                "<generated-registration-count-inspector>",
+                "exec",
+            ),
+            namespace,
+        )
+        self.assertEqual(
+            namespace["inspect_registration_target_count"](object(), "TEST"),
+            304,
+        )
+        self.assertEqual(calls[0][0], "GET")
+        self.assertEqual(
+            calls[0][1],
+            "https://erp.example.org/api/method/frappe.client.get_count",
+        )
+        self.assertEqual(
+            calls[0][2]["params"]["doctype"],
+            "CCD-REG-HOST_DB_TABLE",
+        )
 
     def test_retirement_service_is_not_coupled_to_sync_api(self) -> None:
         source = API.read_text(encoding="utf-8")

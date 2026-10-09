@@ -40,6 +40,10 @@ Manager changes that registration to `Fast Bulk Insert`.
   CCD Registration action logs an error, the remaining actions are skipped, so
   CCD Master cannot continue for that database during the failed cycle. Other
   databases on the same host retain their independent jobs and locks.
+- A partially successful CCD Registration batch is reconciled by source key
+  and exact mapped values. Confirmed rows are checkpointed, missing or
+  conflicting rows remain errors, and a central row-count check must equal the
+  client source count before the CCD Master action may run.
 - Agent delta detection never physically deletes CCD Master rows. A removed
   source key fails closed as `Reconciliation Required`; governed registration
   cancellation and identity retirement remain the authority for source

@@ -651,6 +651,28 @@ def inspect_registration_target_state(session, log_prefix):
         raise RuntimeError("central registration-target inspection returned an invalid response")
     return {{"target_has_rows": bool(rows)}}
 
+def inspect_registration_target_count(session, log_prefix):
+    """Count central CCD-REG rows before allowing the Master pipeline step."""
+    response = request_with_retry(
+        session,
+        "GET",
+        f"{{erpnext_url}}/api/method/frappe.client.get_count",
+        log_prefix,
+        params={{"doctype": ccd_reg_doctype}},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"central registration-target count failed "
+            f"(HTTP {{response.status_code}}): {{response.text[:300]}}"
+        )
+    count = response.json().get("message")
+    if isinstance(count, bool):
+        raise RuntimeError("central registration-target count returned an invalid response")
+    try:
+        return int(count)
+    except (TypeError, ValueError):
+        raise RuntimeError("central registration-target count returned an invalid response")
+
 def inspect_master_source_state(session, lease, log_prefix):
     if not lease:
         raise RuntimeError("central coordination lease is required for safe bootstrap")
@@ -748,6 +770,42 @@ def normalize_mapped_value(fieldtype, value, phone_normalizer=None):
     if normalized_type == "phone" and phone_normalizer:
         return phone_normalizer(value)
     return str(value)
+
+def normalize_registration_compare_value(fieldtype, value):
+    """Canonicalize REST and client values for exact retry confirmation."""
+    normalized_type = str(fieldtype or "Data").strip().lower()
+    if normalized_type in ("date", "datetime"):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        return str(value).strip().replace("T", " ")
+    if normalized_type == "check":
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        normalized = str(value or "").strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            return "1"
+        if normalized in ("", "0", "false", "no", "off", "none"):
+            return "0"
+    if value is None:
+        return ""
+    return str(value)
+
+def registration_rows_match(expected, actual, fieldtype_map):
+    """Return true only when a stored CCD-REG row matches the sent payload."""
+    type_by_field = {{
+        str(field_name).lower(): field_type
+        for field_name, field_type in (fieldtype_map or {{}}).items()
+    }}
+    for field_name, expected_value in expected.items():
+        normalized_name = str(field_name).lower()
+        field_type = type_by_field.get(normalized_name, "Data")
+        if normalize_registration_compare_value(
+            field_type, expected_value
+        ) != normalize_registration_compare_value(
+            field_type, actual.get(normalized_name)
+        ):
+            return False
+    return True
 
 def extract_assignment_fields(expr):
     """Return source field names referenced by assignment helper calls."""
@@ -990,6 +1048,8 @@ def execute_step(step, prev_result):
             # --- Phase 2: build client_map {{ccd_source_key: (hash, cleaned_row)}} ---
             client_map = {{}}
             all_cleaned = []
+            duplicate_source_keys = set()
+            blank_source_keys = 0
             for _row in data_rows:
                 _cleaned = {{}}
                 for field_name in fieldtype_map:
@@ -1005,8 +1065,27 @@ def execute_step(step, prev_result):
                     _cleaned["ccd_source_key"] = "+".join(str(_row.get(f, "")) for f in pk_fields_reg)
                 _key = _cleaned.get("ccd_source_key", "")
                 _hash = compute_row_hash(_cleaned)
+                if not str(_key).strip():
+                    blank_source_keys += 1
+                elif _key in client_map:
+                    duplicate_source_keys.add(_key)
                 client_map[_key] = (_hash, _cleaned)
                 all_cleaned.append(_cleaned)
+
+            if _pipeline_step_failed:
+                write_log(
+                    "SYNC_TO_CCD_REG_BULK: mapping failed; no CCD Registration rows changed",
+                    "ERROR",
+                )
+                return prev_result
+            if blank_source_keys or duplicate_source_keys:
+                write_log(
+                    "SYNC_TO_CCD_REG_BULK: source-key validation failed — "
+                    f"{{blank_source_keys}} blank and {{len(duplicate_source_keys)}} duplicate key(s); "
+                    "no CCD Registration rows changed",
+                    "ERROR",
+                )
+                return prev_result
 
             _cache_path = os.path.join(os.path.dirname(log_file), f"{{source_id}}_CCD-REG_delta_cache.json")
             _cache = load_delta_cache(_cache_path)
@@ -1020,6 +1099,164 @@ def execute_step(step, prev_result):
                     checkpoint_key = checkpoint_row.get("ccd_source_key", "")
                     if checkpoint_key in client_map:
                         _progress_cache[checkpoint_key] = client_map[checkpoint_key][0]
+
+            def reconcile_registration_rows(rows_to_reconcile):
+                """Confirm only stored rows whose values exactly match the payload."""
+                rows_by_key = {{
+                    str(row.get("ccd_source_key") or ""): row
+                    for row in rows_to_reconcile
+                    if str(row.get("ccd_source_key") or "")
+                }}
+                confirmed_rows = []
+                unresolved_rows = []
+                conflicting_rows = []
+                doctype_url = _urlquote(ccd_doctype, safe="")
+                requested_fields = sorted(
+                    {{
+                        str(field_name).lower()
+                        for row in rows_by_key.values()
+                        for field_name in row
+                    }}
+                )
+                if "name" not in requested_fields:
+                    requested_fields.insert(0, "name")
+
+                keys = list(rows_by_key)
+                for offset in range(0, len(keys), 20):
+                    key_chunk = keys[offset:offset + 20]
+                    try:
+                        check_r = request_with_retry(
+                            sess,
+                            "GET",
+                            f"{{erpnext_url}}/api/resource/{{doctype_url}}",
+                            "SYNC_TO_CCD_REG_BULK",
+                            max_attempts=1,
+                            params={{
+                                "filters": json.dumps([
+                                    ["ccd_source_key", "in", key_chunk]
+                                ]),
+                                "fields": json.dumps(requested_fields),
+                                "limit_page_length": len(key_chunk) + 1,
+                            }},
+                        )
+                    except Exception:
+                        unresolved_rows.extend(rows_by_key[key] for key in key_chunk)
+                        continue
+                    if check_r.status_code != 200:
+                        unresolved_rows.extend(rows_by_key[key] for key in key_chunk)
+                        continue
+                    stored_rows = check_r.json().get("data", [])
+                    stored_by_key = {{
+                        str(stored.get("ccd_source_key") or ""): {{
+                            str(field_name).lower(): value
+                            for field_name, value in stored.items()
+                        }}
+                        for stored in stored_rows
+                    }}
+                    for key in key_chunk:
+                        expected_row = rows_by_key[key]
+                        stored_row = stored_by_key.get(key)
+                        if stored_row is None:
+                            unresolved_rows.append(expected_row)
+                        elif registration_rows_match(
+                            expected_row, stored_row, fieldtype_map
+                        ):
+                            confirmed_rows.append(expected_row)
+                        else:
+                            conflicting_rows.append(expected_row)
+                            unresolved_rows.append(expected_row)
+
+                if confirmed_rows:
+                    checkpoint_reg_rows(confirmed_rows)
+                    save_delta_cache(_cache_path, _progress_cache)
+                    write_log(
+                        "SYNC_TO_CCD_REG_BULK: reconciled "
+                        f"{{len(confirmed_rows)}} committed row(s) after a partial or ambiguous insert"
+                    )
+                return confirmed_rows, unresolved_rows, conflicting_rows
+
+            def insert_registration_chunk(chunk):
+                """Insert a batch and return exact inserted/unresolved counts."""
+                try:
+                    response = request_with_retry(
+                        sess,
+                        "POST",
+                        f"{{erpnext_url}}/api/method/agent_bulk_sync",
+                        "SYNC_TO_CCD_REG_BULK",
+                        safe_to_retry=False,
+                        json={{
+                            "action": "insert_batch",
+                            "doctype": ccd_doctype,
+                            "rows": json.dumps(chunk),
+                        }},
+                    )
+                except Exception as request_error:
+                    write_log(
+                        "SYNC_TO_CCD_REG_BULK: insert response was ambiguous; "
+                        "verifying the affected batch before retry",
+                        "WARN",
+                    )
+                    time.sleep(2)
+                    _confirmed, unresolved, conflicts = reconcile_registration_rows(chunk)
+                    if unresolved:
+                        write_log(
+                            "SYNC_TO_CCD_REG_BULK: insert incomplete after ambiguous response — "
+                            f"{{len(unresolved)}} unresolved row(s), {{len(conflicts)}} conflicting row(s): "
+                            f"{{request_error}}",
+                            "ERROR",
+                        )
+                    return 0, len(unresolved), []
+
+                if response.status_code != 200:
+                    _confirmed, unresolved, conflicts = reconcile_registration_rows(chunk)
+                    if unresolved:
+                        write_log(
+                            f"SYNC_TO_CCD_REG_BULK: insert failed ({{response.status_code}}); "
+                            f"{{len(unresolved)}} unresolved row(s), {{len(conflicts)}} conflicting row(s): "
+                            f"{{response.text[:300]}}",
+                            "ERROR",
+                        )
+                    else:
+                        write_log(
+                            f"SYNC_TO_CCD_REG_BULK: HTTP {{response.status_code}} was ambiguous, "
+                            "but every row was confirmed in CCD Registration",
+                            "WARN",
+                        )
+                    return 0, len(unresolved), []
+
+                message = response.json().get("message", {{}})
+                inserted = int(message.get("inserted", 0) or 0)
+                confirmed_existing = int(message.get("confirmed_existing", 0) or 0)
+                batch_errors = message.get("errors", [])
+                if not isinstance(batch_errors, list):
+                    batch_errors = [str(batch_errors)]
+                if not batch_errors and inserted + confirmed_existing >= len(chunk):
+                    checkpoint_reg_rows(chunk)
+                    save_delta_cache(_cache_path, _progress_cache)
+                    return inserted, 0, []
+
+                _confirmed, unresolved, conflicts = reconcile_registration_rows(chunk)
+                if unresolved:
+                    if batch_errors and len(batch_errors) == len(unresolved):
+                        for batch_error in batch_errors[:3]:
+                            write_log(
+                                f"SYNC_TO_CCD_REG_BULK: insert error: {{batch_error}}",
+                                "ERROR",
+                            )
+                    else:
+                        write_log(
+                            "SYNC_TO_CCD_REG_BULK: partial insert remains incomplete — "
+                            f"{{len(unresolved)}} unresolved row(s), {{len(conflicts)}} conflicting row(s); "
+                            f"server reported {{len(batch_errors)}} row error(s)",
+                            "ERROR",
+                        )
+                elif batch_errors:
+                    write_log(
+                        "SYNC_TO_CCD_REG_BULK: all rows reported by the server were "
+                        "confirmed as identical committed retries",
+                        "WARN",
+                    )
+                return inserted, len(unresolved), batch_errors
 
             if _cache is None:
                 write_log(f"SYNC_TO_CCD_REG_BULK: no cache — running full sync")
@@ -1052,26 +1289,12 @@ def execute_step(step, prev_result):
                 total_rows = len(all_cleaned)
                 for i in range(0, total_rows, batch_size):
                     chunk = all_cleaned[i:i + batch_size]
-                    ins_r = request_with_retry(
-                        sess, "POST", f"{{erpnext_url}}/api/method/agent_bulk_sync", "SYNC_TO_CCD_REG_BULK",
-                        safe_to_retry=False,
-                        json={{"action": "insert_batch", "doctype": ccd_doctype, "rows": json.dumps(chunk)}}
-                    )
-                    if ins_r.status_code == 200:
-                        msg = ins_r.json().get("message", {{}})
-                        created += msg.get("inserted", len(chunk))
-                        _berrs = msg.get("errors", [])
-                        errors += len(_berrs)
-                        if not _berrs:
-                            checkpoint_reg_rows(chunk)
-                        for be in _berrs[:3]:
-                            write_log(f"SYNC_TO_CCD_REG_BULK: insert error: {{be}}", "ERROR")
-                    else:
-                        errors += len(chunk)
-                        write_log(f"SYNC_TO_CCD_REG_BULK: batch failed ({{ins_r.status_code}}): {{ins_r.text[:300]}}", "ERROR")
+                    inserted_count, unresolved_count, _berrs = insert_registration_chunk(chunk)
+                    created += inserted_count
+                    errors += unresolved_count
                     _bn = i // batch_size + 1
                     _bt = (total_rows + batch_size - 1) // batch_size
-                    if _bn % 10 == 0 or _bn == _bt or ins_r.status_code != 200 or _berrs:
+                    if _bn % 10 == 0 or _bn == _bt or unresolved_count or _berrs:
                         save_delta_cache(_cache_path, _progress_cache)
                     write_log(f"SYNC_TO_CCD_REG_BULK: insert batch {{_bn}}/{{_bt}} done")
             else:
@@ -1082,24 +1305,9 @@ def execute_step(step, prev_result):
 
                 for i in range(0, len(to_insert), batch_size):
                     chunk = to_insert[i:i + batch_size]
-                    ins_r = request_with_retry(
-                        sess, "POST", f"{{erpnext_url}}/api/method/agent_bulk_sync", "SYNC_TO_CCD_REG_BULK",
-                        safe_to_retry=False,
-                        json={{"action": "insert_batch", "doctype": ccd_doctype, "rows": json.dumps(chunk)}}
-                    )
-                    if ins_r.status_code == 200:
-                        msg = ins_r.json().get("message", {{}})
-                        created += msg.get("inserted", len(chunk))
-                        _berrs = msg.get("errors", [])
-                        errors += len(_berrs)
-                        if not _berrs:
-                            checkpoint_reg_rows(chunk)
-                            save_delta_cache(_cache_path, _progress_cache)
-                        for be in _berrs[:3]:
-                            write_log(f"SYNC_TO_CCD_REG_BULK: insert error: {{be}}", "ERROR")
-                    else:
-                        errors += len(chunk)
-                        write_log(f"SYNC_TO_CCD_REG_BULK: insert failed ({{ins_r.status_code}}): {{ins_r.text[:300]}}", "ERROR")
+                    inserted_count, unresolved_count, _berrs = insert_registration_chunk(chunk)
+                    created += inserted_count
+                    errors += unresolved_count
 
                 for i in range(0, len(to_delete), batch_size):
                     chunk = to_delete[i:i + batch_size]
@@ -1126,23 +1334,58 @@ def execute_step(step, prev_result):
                         msg = upd_r.json().get("message", {{}})
                         updated += msg.get("updated", len(chunk))
                         _berrs = msg.get("errors", [])
-                        errors += len(_berrs)
                         if not _berrs:
                             checkpoint_reg_rows(chunk)
                             save_delta_cache(_cache_path, _progress_cache)
-                        for be in _berrs[:3]:
-                            write_log(f"SYNC_TO_CCD_REG_BULK: update error: {{be}}", "ERROR")
+                        else:
+                            _confirmed, unresolved, conflicts = reconcile_registration_rows(chunk)
+                            errors += len(unresolved)
+                            if unresolved:
+                                write_log(
+                                    "SYNC_TO_CCD_REG_BULK: partial update remains incomplete — "
+                                    f"{{len(unresolved)}} unresolved row(s), "
+                                    f"{{len(conflicts)}} conflicting row(s)",
+                                    "ERROR",
+                                )
                     else:
-                        errors += len(chunk)
-                        write_log(f"SYNC_TO_CCD_REG_BULK: update failed ({{upd_r.status_code}}): {{upd_r.text[:300]}}", "ERROR")
+                        _confirmed, unresolved, conflicts = reconcile_registration_rows(chunk)
+                        errors += len(unresolved)
+                        if unresolved:
+                            write_log(
+                                f"SYNC_TO_CCD_REG_BULK: update failed ({{upd_r.status_code}}); "
+                                f"{{len(unresolved)}} unresolved row(s), "
+                                f"{{len(conflicts)}} conflicting row(s): {{upd_r.text[:300]}}",
+                                "ERROR",
+                            )
 
             save_delta_cache(_cache_path, _progress_cache)
-            if errors:
-                pending = sum(1 for key, (row_hash, row) in client_map.items() if _progress_cache.get(key) != row_hash)
-                pending += sum(1 for key in _progress_cache if key not in client_map)
+            pending = sum(1 for key, (row_hash, row) in client_map.items() if _progress_cache.get(key) != row_hash)
+            pending += sum(1 for key in _progress_cache if key not in client_map)
+            registration_count_verified = False
+            try:
+                target_count = inspect_registration_target_count(
+                    sess, "SYNC_TO_CCD_REG_BULK"
+                )
+                registration_count_verified = target_count == len(client_map)
+                if not registration_count_verified:
+                    write_log(
+                        "SYNC_TO_CCD_REG_BULK: CCD Registration completeness check failed — "
+                        f"expected {{len(client_map)}} row(s), found {{target_count}}; "
+                        "CCD Master is blocked for this source",
+                        "ERROR",
+                    )
+            except Exception as count_error:
                 write_log(
-                    f"SYNC_TO_CCD_REG_BULK: progress checkpoint saved; {{pending}} unconfirmed operation(s) will retry next run",
-                    "WARN"
+                    "SYNC_TO_CCD_REG_BULK: could not verify CCD Registration completeness; "
+                    f"CCD Master is blocked for this source: {{count_error}}",
+                    "ERROR",
+                )
+            if errors or pending or not registration_count_verified:
+                write_log(
+                    "SYNC_TO_CCD_REG_BULK: synchronization incomplete — "
+                    f"{{pending}} unconfirmed operation(s) will retry next run; "
+                    "CCD Master is blocked for this source",
+                    "ERROR"
                 )
             write_log(f"SYNC_TO_CCD_REG_BULK: done — {{created}} inserted, {{deleted}} deleted, {{updated}} updated, {{errors}} error(s)")
         except Exception as e:

@@ -126,6 +126,10 @@ can complete an empty post-processing run.
   makes the source recoverable, but determine why heartbeats stopped first.
 - insert HTTP ambiguity: the agent reconciles source keys before retrying; lease
   acquisition also reuses the same token.
+- partial CCD-REG batch: the agent checkpoints exact matching rows and retries
+  only unresolved rows. `CCD Registration completeness check failed` means its
+  central row count differs from the client source count; CCD Master remains
+  blocked for that source.
 - downstream errors: keep fast mode limited to the canary, resolve the logged
   record failures, then rerun. The delta checkpoint preserves confirmed rows.
 - `Reconciliation Required`: read **Latest Error**. Missing/mismatched cache

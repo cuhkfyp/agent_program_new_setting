@@ -77,6 +77,21 @@ Deletes and updates continue through the existing source-scoped API. The new
 route accelerates the initial/new-row bottleneck without replacing colleague
 logic for those operations.
 
+## CCD Registration retry boundary
+
+The existing CCD Registration endpoint can commit successful documents while
+returning validation errors for other rows in the same batch. The agent does
+not retry that entire batch blindly. It reads back the affected source keys in
+small groups and checkpoints only rows whose stored mapped values exactly
+match the submitted payload. A missing row or a same-key/different-value row
+remains unresolved and fails the pipeline step.
+
+Before the next action is allowed, the agent also obtains a central count for
+the generated CCD-REG DocType. The count must match the number of unique client
+source keys, the local checkpoint must have no pending operations, and the run
+must have no unresolved errors. This preserves the fail-closed guarantee that
+CCD Master ingestion cannot proceed from an incomplete CCD Registration run.
+
 ## State model
 
 Each registration exposes:
