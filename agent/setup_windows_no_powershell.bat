@@ -9,7 +9,7 @@ REM installs. Existing daemon_logs and delta-cache files are never touched.
 set "PYTHON_INSTALLER_URL=https://www.python.org/ftp/python/3.13.10/python-3.13.10-amd64.exe"
 if not defined CCD_AGENT_ARTIFACT_BASE_URL set "CCD_AGENT_ARTIFACT_BASE_URL=https://raw.githubusercontent.com/cuhkfyp/agent_program_new_setting/main/agent"
 
-set "AGENT_SHA256=0b242aba031dec5201304eb246a481998a1729a79c7df5a6c41f18bfde5ab6ce"
+set "AGENT_SHA256=28ec0af518f71058d5912270155563410b41c94c71c9f04a4916b95b4be7238d"
 set "CONFIGURE_SHA256=9d08dd3285a8021706f79af7b4629799e720eced079d0ac60033d110e6e3df3c"
 set "REQUIREMENTS_SHA256=ae5ff78ab54babe81b04653a244af8b2ae70c9a87a89f20c14de788a7ea40c87"
 set "STAGE_DIR=%TEMP%\ccd_agent_setup_%RANDOM%_%RANDOM%"

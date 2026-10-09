@@ -152,6 +152,19 @@ frappe.ui.form.on('CCD Registration', {
 });
 """
 
+AGENT_LOCALHOST_FIELD = {
+    "fieldname": "agent_localhost",
+    "label": "Use localhost instead of the server URL",
+    "fieldtype": "Check",
+    "default": "0",
+    "insert_after": "agent_tx_type",
+    "allow_on_submit": 1,
+    "description": (
+        "When enabled, the installed agent connects to 127.0.0.1. "
+        "Desk connection tests continue to use Server/URL."
+    ),
+}
+
 
 SETTINGS_FIELDS: list[dict[str, Any]] = [
     {
@@ -609,6 +622,51 @@ def _install_registration_validation_scripts() -> dict[str, Any]:
     }
 
 
+def _ensure_agent_localhost_field() -> dict[str, Any]:
+    """Preserve the supervisor's field and make the agent-only switch reusable."""
+    row_name = frappe.db.get_value(
+        "DocField",
+        {
+            "parent": "CCD Registration",
+            "parenttype": "DocType",
+            "fieldname": AGENT_LOCALHOST_FIELD["fieldname"],
+        },
+        "name",
+    )
+    if row_name:
+        current = frappe.db.get_value(
+            "DocField",
+            row_name,
+            ["label", "fieldtype", "allow_on_submit", "description"],
+            as_dict=True,
+        )
+        values = {
+            "label": AGENT_LOCALHOST_FIELD["label"],
+            "fieldtype": AGENT_LOCALHOST_FIELD["fieldtype"],
+            "allow_on_submit": AGENT_LOCALHOST_FIELD["allow_on_submit"],
+            "description": AGENT_LOCALHOST_FIELD["description"],
+        }
+        changed = any(current.get(key) != value for key, value in values.items())
+        if changed:
+            frappe.db.set_value(
+                "DocField", row_name, values, update_modified=False
+            )
+        return {
+            "created": False,
+            "updated": changed,
+            "fieldname": AGENT_LOCALHOST_FIELD["fieldname"],
+        }
+
+    doctype = frappe.get_doc("DocType", "CCD Registration")
+    doctype.append("fields", AGENT_LOCALHOST_FIELD)
+    doctype.save(ignore_permissions=True)
+    return {
+        "created": True,
+        "updated": True,
+        "fieldname": AGENT_LOCALHOST_FIELD["fieldname"],
+    }
+
+
 def _refresh_active_agent_installations() -> list[str]:
     """Repair stale copied installers without touching legacy OS selections."""
     templates = {
@@ -660,6 +718,7 @@ def install() -> dict[str, Any]:
     from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
     create_custom_fields(_custom_fields(), update=True)
+    agent_localhost_field = _ensure_agent_localhost_field()
     _initialize_defaults()
     agent_templates = _install_agent_templates()
     agent_template_guards = _install_agent_template_guards()
@@ -677,6 +736,7 @@ def install() -> dict[str, Any]:
             "CCD Registration-agent_sync_state",
             "CCD Master-agent_sync_run_id",
         ],
+        "agent_localhost_field": agent_localhost_field,
         "agent_templates": agent_templates,
         "agent_template_guards": agent_template_guards,
         "registration_validation": registration_validation,

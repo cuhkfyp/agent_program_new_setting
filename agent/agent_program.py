@@ -42,6 +42,11 @@ def normalize_erpnext_base_url(value):
         (parsed.scheme.lower(), parsed.netloc, path, "", "")
     ).rstrip("/")
 
+
+def checkbox_enabled(value):
+    """Interpret Frappe Check values consistently across JSON representations."""
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
 def file_reader_daemon(filepath, interval=5):
     """Daemon:1 — reads and prints file contents every `interval` seconds."""
     print(f"\n👻 Daemon started: reading '{filepath}' every {interval}s")
@@ -2909,6 +2914,9 @@ def process_ccd_registration_doc(doc_data, physical_hostname):
     ).strip()
     ccd_reg_doctype = doc_data.get('ccd_reg_doctype') or f'CCD-REG-{registration_id}'
     agent_status = (doc_data.get('agent_status') or '').strip().lower()
+    configured_db_server = doc_data.get('db_server', '') or 'localhost'
+    use_localhost = checkbox_enabled(doc_data.get('agent_localhost'))
+    db_server = '127.0.0.1' if use_localhost else configured_db_server
 
     if agent_status in ('inactive', 'disabled', 'stopped', 'cancelled', 'canceled'):
         print(f"\n⏭️  Skipping CCD Registration {registration_id}: agent_status={doc_data.get('agent_status')}")
@@ -2933,7 +2941,9 @@ def process_ccd_registration_doc(doc_data, physical_hostname):
     print("\n📋 Connection Information:")
     print("-" * 42)
     print(f"  DB Type:        {doc_data.get('db_type', '')}")
-    print(f"  Server/URL:     {doc_data.get('db_server', '')}")
+    print(f"  Server/URL:     {configured_db_server}")
+    if use_localhost:
+        print("  Agent DB Target: 127.0.0.1 (localhost override enabled)")
     print(f"  Port:           {doc_data.get('db_port', '')}")
     print(f"  Database:       {doc_data.get('db_database', '')}")
     print(f"  Username:       {doc_data.get('db_username', '')}")
@@ -2953,7 +2963,6 @@ def process_ccd_registration_doc(doc_data, physical_hostname):
     print("-" * 42)
 
     db_type = (doc_data.get('db_type', '') or '').upper()
-    db_server = doc_data.get('db_server', '') or 'localhost'
     db_port = doc_data.get('db_port', 0) or 0
     db_database = doc_data.get('db_database', '')
     db_username = doc_data.get('db_username', '')
@@ -3058,7 +3067,7 @@ def process_ccd_registration_doc(doc_data, physical_hostname):
     job_sysVars = {}
     job_sysVars['ccd_table'] = doc_data.get('ccd_table', '')
     job_sysVars['db_type']   = doc_data.get('db_type', '')
-    job_sysVars['db_server'] = doc_data.get('db_server', '')
+    job_sysVars['db_server'] = db_server
     job_sysVars['db_port']   = str(doc_data.get('db_port', ''))
     job_sysVars['db_database'] = doc_data.get('db_database', '')
     job_sysVars['db_username'] = doc_data.get('db_username', '')
@@ -3077,6 +3086,11 @@ def process_ccd_registration_doc(doc_data, physical_hostname):
         resolved = resolve_password_macro(v)
         job_sysVars[k] = resolved
         job_sysVars[k.lower()] = resolved
+    if use_localhost:
+        # The registration checkbox is authoritative even if an older custom
+        # [SYSTEM] block also contains DB_SERVER.
+        job_sysVars['DB_SERVER'] = '127.0.0.1'
+        job_sysVars['db_server'] = '127.0.0.1'
 
     mail_config = sections.get('MAIL', {})
     if mail_config:

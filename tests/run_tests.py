@@ -102,6 +102,19 @@ class StaticContracts(unittest.TestCase):
             "https://erp.example.org/frappe-site",
         )
 
+    def test_localhost_checkbox_controls_effective_database_server(self) -> None:
+        enabled = self._agent_function("checkbox_enabled")
+        for value in (1, True, "1", "true", "YES", "on"):
+            self.assertTrue(enabled(value))
+        for value in (0, False, None, "", "0", "false", "no"):
+            self.assertFalse(enabled(value))
+
+        source = AGENT.read_text(encoding="utf-8")
+        self.assertIn("doc_data.get('agent_localhost')", source)
+        self.assertIn("db_server = '127.0.0.1' if use_localhost", source)
+        self.assertIn("job_sysVars['db_server'] = db_server", source)
+        self.assertIn("localhost override enabled", source)
+
     def test_login_rejects_redirected_html_as_success(self) -> None:
         source = AGENT.read_text(encoding="utf-8")
         login_start = source.index("def login_to_erpnext():")
@@ -432,6 +445,13 @@ class StaticContracts(unittest.TestCase):
         self.assertIn("CCD Register Name must start with CCD-REG-", setup)
         self.assertIn("must contain at least two source components", setup)
         self.assertIn("frm.set_df_property('physical_hostname', 'reqd', 1)", setup)
+
+    def test_localhost_agent_field_is_preserved_and_editable_after_submit(self) -> None:
+        setup = SETUP.read_text(encoding="utf-8")
+        self.assertIn('"fieldname": "agent_localhost"', setup)
+        self.assertIn('"allow_on_submit": 1', setup)
+        self.assertIn("connects to 127.0.0.1", setup)
+        self.assertIn("_ensure_agent_localhost_field()", setup)
 
 
 if __name__ == "__main__":
