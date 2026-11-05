@@ -5,6 +5,8 @@
 `CCD Agent Sync Settings` contains:
 
 - global enable and coordination switches;
+- a default-off **Require Agent V3 for CCD Registration Staging** transition
+  switch;
 - maximum parallel Master ingestions;
 - ingestion and post-processing lease TTLs;
 - default/maximum fast insert batch sizes;
@@ -48,6 +50,12 @@ Run `agent/setup_windows.bat` for the normal curl/PowerShell-fallback path, or
 checksum-pinned assets and store the URL, integration account, site, and
 Socket.IO namespace in Windows Credential Manager. Then start `Run_Agent.bat`.
 Confirm the log shows the governed stable source ID and central configuration.
+
+Also confirm the console prints `2026.11.05-governed-staging-v3` and each job
+completes one governed cycle. Upgrade every client machine before enabling
+**Require Agent V3 for CCD Registration Staging**. Once enabled, legacy V2
+staging calls fail closed; V3 continues normally. Deployment deliberately
+leaves this switch disabled.
 
 Do not delete a delta cache merely to test connectivity. Cache absence is not
 authorization to delete, retire, or rebuild an existing CCD Master source.

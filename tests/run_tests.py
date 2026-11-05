@@ -189,6 +189,7 @@ class StaticContracts(unittest.TestCase):
             "actions": ["SYNC_TO_CCD_REG_BULK", "SYNC_TO_CCD_MASTER_BULK"],
             "_pipeline_step_failed": False,
             "write_log": lambda *_args, **_kwargs: None,
+            "validate_registration_fence": lambda: None,
         }
 
         def execute_step(step: str, previous: object) -> object:
@@ -347,13 +348,13 @@ class StaticContracts(unittest.TestCase):
             status_code = 200
             text = ""
 
-            def __init__(self, rows: list[dict[str, str]]) -> None:
-                self.rows = rows
+            def __init__(self, result: dict[str, object]) -> None:
+                self.result = result
 
-            def json(self) -> dict[str, list[dict[str, str]]]:
-                return {"data": self.rows}
+            def json(self) -> dict[str, dict[str, object]]:
+                return {"message": self.result}
 
-        response = Response([])
+        response = Response({"target_has_rows": False, "count": 0})
         calls: list[tuple[str, str, dict[str, object]]] = []
 
         def request_with_retry(
@@ -367,10 +368,13 @@ class StaticContracts(unittest.TestCase):
             return response
 
         namespace: dict[str, object] = {
-            "_urlquote": quote,
-            "ccd_reg_doctype": "CCD-REG-HOST_DB",
+            "AGENT_SYNC_API": "db_connector.api_agent_sync",
+            "registration_id": "REG-2",
+            "source_id": "HOST-DB",
+            "_authorized_sync_generation": "generation",
             "erpnext_url": "https://erp.example.org",
             "request_with_retry": request_with_retry,
+            "_api_message": lambda result: result.json().get("message", {}),
         }
         exec(
             compile(
@@ -384,19 +388,21 @@ class StaticContracts(unittest.TestCase):
 
         self.assertEqual(
             inspect_target(object(), "TEST"),
-            {"target_has_rows": False},
+            {"target_has_rows": False, "count": 0},
         )
-        response.rows = [{"name": "ROW-1"}]
+        response.result = {"target_has_rows": True, "count": 1}
         self.assertEqual(
             inspect_target(object(), "TEST"),
-            {"target_has_rows": True},
+            {"target_has_rows": True, "count": 1},
         )
         self.assertEqual(calls[0][0], "GET")
         self.assertEqual(
             calls[0][1],
-            "https://erp.example.org/api/resource/CCD-REG-HOST_DB",
+            "https://erp.example.org/api/method/"
+            "db_connector.api_agent_sync.inspect_registration_target",
         )
-        self.assertEqual(calls[0][2]["params"]["limit_page_length"], 1)
+        self.assertEqual(calls[0][2]["params"]["registration"], "REG-2")
+        self.assertEqual(calls[0][2]["params"]["sync_generation"], "generation")
 
     def test_registration_target_count_gate_uses_central_count(self) -> None:
         script = self._generated_daemon_source()
@@ -413,7 +419,7 @@ class StaticContracts(unittest.TestCase):
             text = ""
 
             def json(self) -> dict[str, int]:
-                return {"message": 304}
+                return {"message": {"count": 304}}
 
         calls: list[tuple[str, str, dict[str, object]]] = []
 
@@ -428,9 +434,13 @@ class StaticContracts(unittest.TestCase):
             return Response()
 
         namespace: dict[str, object] = {
-            "ccd_reg_doctype": "CCD-REG-HOST_DB_TABLE",
+            "AGENT_SYNC_API": "db_connector.api_agent_sync",
+            "registration_id": "REG-2",
+            "source_id": "HOST-DB",
+            "_authorized_sync_generation": "generation",
             "erpnext_url": "https://erp.example.org",
             "request_with_retry": request_with_retry,
+            "_api_message": lambda result: result.json().get("message", {}),
         }
         exec(
             compile(
@@ -447,12 +457,37 @@ class StaticContracts(unittest.TestCase):
         self.assertEqual(calls[0][0], "GET")
         self.assertEqual(
             calls[0][1],
-            "https://erp.example.org/api/method/frappe.client.get_count",
+            "https://erp.example.org/api/method/"
+            "db_connector.api_agent_sync.inspect_registration_target",
         )
         self.assertEqual(
-            calls[0][2]["params"]["doctype"],
-            "CCD-REG-HOST_DB_TABLE",
+            calls[0][2]["params"]["sync_generation"],
+            "generation",
         )
+
+    def test_agent_v3_generation_fences_every_staging_request(self) -> None:
+        source = AGENT.read_text(encoding="utf-8")
+        script = self._generated_daemon_source()
+        self.assertIn(
+            'AGENT_PROGRAM_VERSION = "2026.11.05-governed-staging-v3"',
+            source,
+        )
+        self.assertIn("validate_registration_fence()", script)
+        self.assertIn("except RegistrationFenceError as e:", script)
+        for endpoint in (
+            "inspect_registration_target",
+            "get_registration_rows",
+            "insert_registration_batch",
+            "update_registration_batch",
+            "delete_registration_source_keys",
+        ):
+            self.assertIn(f"{{AGENT_SYNC_API}}.{endpoint}", script)
+
+    def test_main_agent_rediscovers_amended_registrations(self) -> None:
+        source = AGENT.read_text(encoding="utf-8")
+        self.assertIn("def discover_and_launch_new_registrations():", source)
+        self.assertIn('CCD_AGENT_DISCOVERY_INTERVAL", "60"', source)
+        self.assertIn("time.monotonic() >= next_discovery_at", source)
 
     def test_retirement_service_is_not_coupled_to_sync_api(self) -> None:
         source = API.read_text(encoding="utf-8")

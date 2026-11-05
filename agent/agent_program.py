@@ -15,6 +15,8 @@ from urllib.parse import quote as urlquote, urlsplit, urlunsplit
 import socketio
 import urllib3
 
+AGENT_PROGRAM_VERSION = "2026.11.05-governed-staging-v3"
+
 import truststore
 truststore.inject_into_ssl()
 
@@ -255,9 +257,13 @@ ccd_reg_doctype = "{ccd_reg_doctype_escaped}" or f"CCD-REG-{{registration_id}}"
 _hostname = physical_hostname
 
 _pipeline_step_failed = False
+_authorized_sync_generation = ""
 
 class PipelineStepFailed(RuntimeError):
     """Stop later actions when the current action logged a hard failure."""
+
+class RegistrationFenceError(RuntimeError):
+    """Stop this stale daemon permanently without touching its local caches."""
 
 def write_log(msg, level="INFO"):
     global _pipeline_step_failed
@@ -477,6 +483,66 @@ def _api_message(response):
     except Exception:
         return {{}}
 
+def validate_registration_fence(log_prefix="REGISTRATION_FENCE"):
+    """Bind this daemon to one active submitted Registration generation."""
+    global _authorized_sync_generation
+    import requests as _req
+    session = _req.Session()
+    session.verify = True
+    login_r = request_with_retry(
+        session,
+        "POST",
+        f"{{erpnext_url}}/api/method/login",
+        log_prefix,
+        data={{"usr": erpnext_user, "pwd": erpnext_pass}},
+    )
+    if login_r.status_code != 200:
+        raise RuntimeError(
+            f"registration-fence login failed (HTTP {{login_r.status_code}})"
+        )
+    response = request_with_retry(
+        session,
+        "GET",
+        f"{{erpnext_url}}/api/method/{{AGENT_SYNC_API}}.get_sync_config",
+        log_prefix,
+        max_attempts=1,
+        params={{
+            "registration": registration_id,
+            "source_id": source_id,
+            "physical_hostname": physical_hostname,
+            "database_name": db_database,
+            "sync_generation": _authorized_sync_generation,
+        }},
+    )
+    if response.status_code in {{403, 404}}:
+        raise RegistrationFenceError(
+            "Registration was retired, cancelled, held, or superseded; "
+            "this stale daemon is stopping"
+        )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"registration-fence validation unavailable "
+            f"(HTTP {{response.status_code}})"
+        )
+    config = _api_message(response)
+    generation = str(config.get("sync_generation") or "")
+    if (
+        not isinstance(config, dict)
+        or int(config.get("agent_protocol") or 0) < 3
+        or not config.get("governed_staging")
+        or not generation
+        or str(config.get("staging_doctype") or "") != ccd_reg_doctype
+    ):
+        raise RegistrationFenceError(
+            "Server does not expose the exact governed Agent V3 staging scope"
+        )
+    if _authorized_sync_generation and generation != _authorized_sync_generation:
+        raise RegistrationFenceError(
+            "Registration synchronization generation changed; stale daemon is stopping"
+        )
+    _authorized_sync_generation = generation
+    return config
+
 def get_master_sync_config(session, log_prefix):
     """Fetch optional central settings used by coordinated CCD Master sync."""
     response = request_with_retry(
@@ -489,6 +555,7 @@ def get_master_sync_config(session, log_prefix):
             "source_id": source_id,
             "physical_hostname": physical_hostname,
             "database_name": db_database,
+            "sync_generation": _authorized_sync_generation,
         }},
     )
     if response.status_code != 200:
@@ -633,45 +700,101 @@ def report_reconciliation_required(session, config, reason_code, log_prefix):
 
 def inspect_registration_target_state(session, log_prefix):
     """Fail closed unless the generated CCD Registration target can be inspected."""
-    doctype_url = _urlquote(ccd_reg_doctype, safe="")
     response = request_with_retry(
         session,
         "GET",
-        f"{{erpnext_url}}/api/resource/{{doctype_url}}",
+        f"{{erpnext_url}}/api/method/{{AGENT_SYNC_API}}.inspect_registration_target",
         log_prefix,
-        params={{"fields": '["name"]', "limit_page_length": 1}},
+        params={{
+            "registration": registration_id,
+            "source_id": source_id,
+            "sync_generation": _authorized_sync_generation,
+        }},
     )
     if response.status_code != 200:
         raise RuntimeError(
             f"central registration-target inspection failed "
             f"(HTTP {{response.status_code}}): {{response.text[:300]}}"
         )
-    rows = response.json().get("data")
-    if not isinstance(rows, list):
+    result = _api_message(response)
+    if not isinstance(result, dict) or "target_has_rows" not in result:
         raise RuntimeError("central registration-target inspection returned an invalid response")
-    return {{"target_has_rows": bool(rows)}}
+    return result
 
 def inspect_registration_target_count(session, log_prefix):
     """Count central CCD-REG rows before allowing the Master pipeline step."""
     response = request_with_retry(
         session,
         "GET",
-        f"{{erpnext_url}}/api/method/frappe.client.get_count",
+        f"{{erpnext_url}}/api/method/{{AGENT_SYNC_API}}.inspect_registration_target",
         log_prefix,
-        params={{"doctype": ccd_reg_doctype}},
+        params={{
+            "registration": registration_id,
+            "source_id": source_id,
+            "sync_generation": _authorized_sync_generation,
+        }},
     )
     if response.status_code != 200:
         raise RuntimeError(
             f"central registration-target count failed "
             f"(HTTP {{response.status_code}}): {{response.text[:300]}}"
         )
-    count = response.json().get("message")
+    count = _api_message(response).get("count")
     if isinstance(count, bool):
         raise RuntimeError("central registration-target count returned an invalid response")
     try:
         return int(count)
     except (TypeError, ValueError):
         raise RuntimeError("central registration-target count returned an invalid response")
+
+def confirm_registration_baseline_batch(session, rows, log_prefix):
+    """Prove one existing CCD-REG batch without changing any server row."""
+    response = request_with_retry(
+        session,
+        "POST",
+        f"{{erpnext_url}}/api/method/{{AGENT_SYNC_API}}.confirm_registration_baseline_batch",
+        log_prefix,
+        safe_to_retry=True,
+        json={{
+            "registration": registration_id,
+            "source_id": source_id,
+            "sync_generation": _authorized_sync_generation,
+            "rows": json.dumps(rows, default=str),
+        }},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            "central staging-baseline confirmation failed "
+            f"(HTTP {{response.status_code}}): {{response.text[:300]}}"
+        )
+    result = _api_message(response)
+    if not isinstance(result, dict):
+        raise RuntimeError("central staging-baseline confirmation returned invalid data")
+    return result
+
+def complete_registration_baseline_adoption(session, log_prefix):
+    """Finish the server stability check before persisting the local cache."""
+    response = request_with_retry(
+        session,
+        "POST",
+        f"{{erpnext_url}}/api/method/{{AGENT_SYNC_API}}.complete_registration_baseline_adoption",
+        log_prefix,
+        safe_to_retry=True,
+        json={{
+            "registration": registration_id,
+            "source_id": source_id,
+            "sync_generation": _authorized_sync_generation,
+        }},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            "central staging-baseline completion failed "
+            f"(HTTP {{response.status_code}}): {{response.text[:300]}}"
+        )
+    result = _api_message(response)
+    if not isinstance(result, dict):
+        raise RuntimeError("central staging-baseline completion returned invalid data")
+    return result
 
 def inspect_master_source_state(session, lease, log_prefix):
     if not lease:
@@ -1110,7 +1233,6 @@ def execute_step(step, prev_result):
                 confirmed_rows = []
                 unresolved_rows = []
                 conflicting_rows = []
-                doctype_url = _urlquote(ccd_doctype, safe="")
                 requested_fields = sorted(
                     {{
                         str(field_name).lower()
@@ -1128,15 +1250,15 @@ def execute_step(step, prev_result):
                         check_r = request_with_retry(
                             sess,
                             "GET",
-                            f"{{erpnext_url}}/api/resource/{{doctype_url}}",
+                            f"{{erpnext_url}}/api/method/{{AGENT_SYNC_API}}.get_registration_rows",
                             "SYNC_TO_CCD_REG_BULK",
                             max_attempts=1,
                             params={{
-                                "filters": json.dumps([
-                                    ["ccd_source_key", "in", key_chunk]
-                                ]),
+                                "registration": registration_id,
+                                "source_id": source_id,
+                                "sync_generation": _authorized_sync_generation,
+                                "source_keys": json.dumps(key_chunk),
                                 "fields": json.dumps(requested_fields),
-                                "limit_page_length": len(key_chunk) + 1,
                             }},
                         )
                     except Exception:
@@ -1145,7 +1267,7 @@ def execute_step(step, prev_result):
                     if check_r.status_code != 200:
                         unresolved_rows.extend(rows_by_key[key] for key in key_chunk)
                         continue
-                    stored_rows = check_r.json().get("data", [])
+                    stored_rows = _api_message(check_r).get("rows", [])
                     stored_by_key = {{
                         str(stored.get("ccd_source_key") or ""): {{
                             str(field_name).lower(): value
@@ -1181,13 +1303,14 @@ def execute_step(step, prev_result):
                     response = request_with_retry(
                         sess,
                         "POST",
-                        f"{{erpnext_url}}/api/method/agent_bulk_sync",
+                        f"{{erpnext_url}}/api/method/{{AGENT_SYNC_API}}.insert_registration_batch",
                         "SYNC_TO_CCD_REG_BULK",
                         safe_to_retry=False,
                         json={{
-                            "action": "insert_batch",
-                            "doctype": ccd_doctype,
-                            "rows": json.dumps(chunk),
+                            "registration": registration_id,
+                            "source_id": source_id,
+                            "sync_generation": _authorized_sync_generation,
+                            "rows": json.dumps(chunk, default=str),
                         }},
                     )
                 except Exception as request_error:
@@ -1224,7 +1347,7 @@ def execute_step(step, prev_result):
                         )
                     return 0, len(unresolved), []
 
-                message = response.json().get("message", {{}})
+                message = _api_message(response)
                 inserted = int(message.get("inserted", 0) or 0)
                 confirmed_existing = int(message.get("confirmed_existing", 0) or 0)
                 batch_errors = message.get("errors", [])
@@ -1273,30 +1396,118 @@ def execute_step(step, prev_result):
                     return prev_result
                 if _target_state.get("target_has_rows"):
                     write_log(
-                        "SYNC_TO_CCD_REG_BULK: Reconciliation Required — "
-                        "local cache is missing but the CCD Registration target has rows; "
-                        "automatic clearing is disabled",
-                        "ERROR",
+                        "SYNC_TO_CCD_REG_BULK: existing target detected — "
+                        "requesting governed zero-write staging-baseline confirmation"
                     )
-                    return prev_result
-                write_log(
-                    "SYNC_TO_CCD_REG_BULK: verified empty target — "
-                    "starting non-destructive full insert"
-                )
-                _progress_cache.clear()
-                _progress_ready = True
-                save_delta_cache(_cache_path, _progress_cache)
-                total_rows = len(all_cleaned)
-                for i in range(0, total_rows, batch_size):
-                    chunk = all_cleaned[i:i + batch_size]
-                    inserted_count, unresolved_count, _berrs = insert_registration_chunk(chunk)
-                    created += inserted_count
-                    errors += unresolved_count
-                    _bn = i // batch_size + 1
-                    _bt = (total_rows + batch_size - 1) // batch_size
-                    if _bn % 10 == 0 or _bn == _bt or unresolved_count or _berrs:
-                        save_delta_cache(_cache_path, _progress_cache)
-                    write_log(f"SYNC_TO_CCD_REG_BULK: insert batch {{_bn}}/{{_bt}} done")
+                    adoption_batch_size = 500
+                    total_rows = len(all_cleaned)
+                    final_result = {{}}
+                    for i in range(0, total_rows, adoption_batch_size):
+                        chunk = all_cleaned[i:i + adoption_batch_size]
+                        try:
+                            result = confirm_registration_baseline_batch(
+                                sess, chunk, "SYNC_TO_CCD_REG_BULK"
+                            )
+                        except Exception as adoption_error:
+                            write_log(
+                                "SYNC_TO_CCD_REG_BULK: Reconciliation Required — "
+                                "governed staging-baseline confirmation failed; "
+                                f"no local cache or server row changed: {{adoption_error}}",
+                                "ERROR",
+                            )
+                            return prev_result
+                        result_errors = result.get("errors") or []
+                        if (
+                            result_errors
+                            or int(result.get("confirmed_existing") or 0) != len(chunk)
+                        ):
+                            write_log(
+                                "SYNC_TO_CCD_REG_BULK: Reconciliation Required — "
+                                "an existing staging row was missing or different; "
+                                f"no local cache or server row changed: {{result_errors[:3]}}",
+                                "ERROR",
+                            )
+                            return prev_result
+                        final_result = result
+                        _bn = i // adoption_batch_size + 1
+                        _bt = (total_rows + adoption_batch_size - 1) // adoption_batch_size
+                        if _bn % 10 == 0 or _bn == _bt:
+                            write_log(
+                                "SYNC_TO_CCD_REG_BULK: confirmed exact existing "
+                                f"staging batch {{_bn}}/{{_bt}} "
+                                f"({{int(result.get('staging_progress') or 0)}} / "
+                                f"{{int(result.get('staging_expected') or total_rows)}} rows)"
+                            )
+                    if (
+                        not final_result.get("ready_to_finalize")
+                        or int(final_result.get("staging_progress") or 0) != total_rows
+                        or int(final_result.get("staging_expected") or 0) != total_rows
+                    ):
+                        write_log(
+                            "SYNC_TO_CCD_REG_BULK: Reconciliation Required — "
+                            "the complete authorized staging population was not confirmed; "
+                            "no local cache or server row changed",
+                            "ERROR",
+                        )
+                        return prev_result
+                    try:
+                        completion = complete_registration_baseline_adoption(
+                            sess, "SYNC_TO_CCD_REG_BULK"
+                        )
+                    except Exception as completion_error:
+                        write_log(
+                            "SYNC_TO_CCD_REG_BULK: Reconciliation Required — "
+                            "the staging population failed its final stability check; "
+                            f"no local cache or server row changed: {{completion_error}}",
+                            "ERROR",
+                        )
+                        return prev_result
+                    if completion.get("errors") or not completion.get("complete"):
+                        write_log(
+                            "SYNC_TO_CCD_REG_BULK: Reconciliation Required — "
+                            "the staging population changed during confirmation; "
+                            f"no local cache or server row changed: "
+                            f"{{(completion.get('errors') or [])[:3]}}",
+                            "ERROR",
+                        )
+                        return prev_result
+                    _progress_cache = {{
+                        key: value_hash
+                        for key, (value_hash, _row) in client_map.items()
+                    }}
+                    save_delta_cache(_cache_path, _progress_cache)
+                    persisted_cache = load_delta_cache(_cache_path)
+                    if persisted_cache != _progress_cache:
+                        write_log(
+                            "SYNC_TO_CCD_REG_BULK: exact staging rows were confirmed, "
+                            "but the local cache could not be persisted; no server row changed",
+                            "ERROR",
+                        )
+                        return prev_result
+                    _progress_ready = True
+                    write_log(
+                        "SYNC_TO_CCD_REG_BULK: governed staging baseline adopted — "
+                        f"{{total_rows}} exact rows, 0 inserted, 0 deleted, 0 updated"
+                    )
+                else:
+                    write_log(
+                        "SYNC_TO_CCD_REG_BULK: verified empty target — "
+                        "starting non-destructive full insert"
+                    )
+                    _progress_cache.clear()
+                    _progress_ready = True
+                    save_delta_cache(_cache_path, _progress_cache)
+                    total_rows = len(all_cleaned)
+                    for i in range(0, total_rows, batch_size):
+                        chunk = all_cleaned[i:i + batch_size]
+                        inserted_count, unresolved_count, _berrs = insert_registration_chunk(chunk)
+                        created += inserted_count
+                        errors += unresolved_count
+                        _bn = i // batch_size + 1
+                        _bt = (total_rows + batch_size - 1) // batch_size
+                        if _bn % 10 == 0 or _bn == _bt or unresolved_count or _berrs:
+                            save_delta_cache(_cache_path, _progress_cache)
+                        write_log(f"SYNC_TO_CCD_REG_BULK: insert batch {{_bn}}/{{_bt}} done")
             else:
                 to_insert = [row for ck, (ch, row) in client_map.items() if ck not in _cache]
                 to_delete = [ck for ck in _cache if ck not in client_map]
@@ -1312,14 +1523,33 @@ def execute_step(step, prev_result):
                 for i in range(0, len(to_delete), batch_size):
                     chunk = to_delete[i:i + batch_size]
                     del_r = request_with_retry(
-                        sess, "POST", f"{{erpnext_url}}/api/method/agent_bulk_sync", "SYNC_TO_CCD_REG_BULK",
-                        json={{"action": "delete_by_source_keys", "doctype": ccd_doctype, "keys": json.dumps(chunk)}}
+                        sess,
+                        "POST",
+                        f"{{erpnext_url}}/api/method/{{AGENT_SYNC_API}}.delete_registration_source_keys",
+                        "SYNC_TO_CCD_REG_BULK",
+                        json={{
+                            "registration": registration_id,
+                            "source_id": source_id,
+                            "sync_generation": _authorized_sync_generation,
+                            "source_keys": json.dumps(chunk),
+                        }},
                     )
                     if del_r.status_code == 200:
-                        deleted += del_r.json().get("message", {{}}).get("deleted", len(chunk))
-                        for deleted_key in chunk:
-                            _progress_cache.pop(deleted_key, None)
-                        save_delta_cache(_cache_path, _progress_cache)
+                        delete_message = _api_message(del_r)
+                        _berrs = delete_message.get("errors", [])
+                        accepted = int(delete_message.get("accepted") or 0)
+                        deleted += int(delete_message.get("deleted") or 0)
+                        if not _berrs and accepted == len(chunk):
+                            for deleted_key in chunk:
+                                _progress_cache.pop(deleted_key, None)
+                            save_delta_cache(_cache_path, _progress_cache)
+                        else:
+                            errors += max(1, len(chunk) - accepted)
+                            write_log(
+                                "SYNC_TO_CCD_REG_BULK: governed staging delete "
+                                f"accepted {{accepted}}/{{len(chunk)}} row(s): {{_berrs[:3]}}",
+                                "ERROR",
+                            )
                     else:
                         errors += len(chunk)
                         write_log(f"SYNC_TO_CCD_REG_BULK: delete failed ({{del_r.status_code}}): {{del_r.text[:300]}}", "ERROR")
@@ -1327,11 +1557,19 @@ def execute_step(step, prev_result):
                 for i in range(0, len(to_update), batch_size):
                     chunk = to_update[i:i + batch_size]
                     upd_r = request_with_retry(
-                        sess, "POST", f"{{erpnext_url}}/api/method/agent_bulk_sync", "SYNC_TO_CCD_REG_BULK",
-                        json={{"action": "update_batch", "doctype": ccd_doctype, "rows": json.dumps(chunk)}}
+                        sess,
+                        "POST",
+                        f"{{erpnext_url}}/api/method/{{AGENT_SYNC_API}}.update_registration_batch",
+                        "SYNC_TO_CCD_REG_BULK",
+                        json={{
+                            "registration": registration_id,
+                            "source_id": source_id,
+                            "sync_generation": _authorized_sync_generation,
+                            "rows": json.dumps(chunk, default=str),
+                        }},
                     )
                     if upd_r.status_code == 200:
-                        msg = upd_r.json().get("message", {{}})
+                        msg = _api_message(upd_r)
                         updated += msg.get("updated", len(chunk))
                         _berrs = msg.get("errors", [])
                         if not _berrs:
@@ -1531,7 +1769,6 @@ def execute_step(step, prev_result):
 
             if _cache is None:
                 write_log(f"SYNC_TO_CCD_REG: no cache — running full sync")
-                _ccd_doctype_url = _urlquote(ccd_doctype, safe='')
                 try:
                     _target_state = inspect_registration_target_state(
                         sess, "SYNC_TO_CCD_REG"
@@ -1560,10 +1797,24 @@ def execute_step(step, prev_result):
                 save_delta_cache(_cache_path, _progress_cache)
                 for ck, (ch, crow) in client_map.items():
                     r = request_with_retry(
-                        sess, "POST", f"{{erpnext_url}}/api/resource/{{_ccd_doctype_url}}", "SYNC_TO_CCD_REG",
-                        safe_to_retry=False, json=crow
+                        sess,
+                        "POST",
+                        f"{{erpnext_url}}/api/method/{{AGENT_SYNC_API}}.insert_registration_batch",
+                        "SYNC_TO_CCD_REG",
+                        safe_to_retry=False,
+                        json={{
+                            "registration": registration_id,
+                            "source_id": source_id,
+                            "sync_generation": _authorized_sync_generation,
+                            "rows": json.dumps([crow], default=str),
+                        }},
                     )
-                    if r.status_code in (200, 201):
+                    insert_message = _api_message(r) if r.status_code == 200 else {{}}
+                    if (
+                        r.status_code == 200
+                        and not insert_message.get("errors")
+                        and int(insert_message.get("accepted") or 0) == 1
+                    ):
                         created += 1
                         checkpoint_reg_row(crow)
                         save_delta_cache(_cache_path, _progress_cache)
@@ -1577,12 +1828,25 @@ def execute_step(step, prev_result):
                 write_log(f"SYNC_TO_CCD_REG: delta — {{len(to_insert)}} insert, {{len(to_delete)}} delete, {{len(to_update)}} update")
 
                 for _row in to_insert:
-                    _ccd_doctype_url = _urlquote(ccd_doctype, safe='')
                     r = request_with_retry(
-                        sess, "POST", f"{{erpnext_url}}/api/resource/{{_ccd_doctype_url}}", "SYNC_TO_CCD_REG",
-                        safe_to_retry=False, json=_row
+                        sess,
+                        "POST",
+                        f"{{erpnext_url}}/api/method/{{AGENT_SYNC_API}}.insert_registration_batch",
+                        "SYNC_TO_CCD_REG",
+                        safe_to_retry=False,
+                        json={{
+                            "registration": registration_id,
+                            "source_id": source_id,
+                            "sync_generation": _authorized_sync_generation,
+                            "rows": json.dumps([_row], default=str),
+                        }},
                     )
-                    if r.status_code in (200, 201):
+                    insert_message = _api_message(r) if r.status_code == 200 else {{}}
+                    if (
+                        r.status_code == 200
+                        and not insert_message.get("errors")
+                        and int(insert_message.get("accepted") or 0) == 1
+                    ):
                         created += 1
                         checkpoint_reg_row(_row)
                         save_delta_cache(_cache_path, _progress_cache)
@@ -1593,14 +1857,28 @@ def execute_step(step, prev_result):
                 for i in range(0, len(to_delete), batch_size):
                     chunk = to_delete[i:i + batch_size]
                     del_r = request_with_retry(
-                        sess, "POST", f"{{erpnext_url}}/api/method/agent_bulk_sync", "SYNC_TO_CCD_REG",
-                        json={{"action": "delete_by_source_keys", "doctype": ccd_doctype, "keys": json.dumps(chunk)}}
+                        sess,
+                        "POST",
+                        f"{{erpnext_url}}/api/method/{{AGENT_SYNC_API}}.delete_registration_source_keys",
+                        "SYNC_TO_CCD_REG",
+                        json={{
+                            "registration": registration_id,
+                            "source_id": source_id,
+                            "sync_generation": _authorized_sync_generation,
+                            "source_keys": json.dumps(chunk),
+                        }},
                     )
                     if del_r.status_code == 200:
-                        deleted += del_r.json().get("message", {{}}).get("deleted", len(chunk))
-                        for deleted_key in chunk:
-                            _progress_cache.pop(deleted_key, None)
-                        save_delta_cache(_cache_path, _progress_cache)
+                        msg = _api_message(del_r)
+                        accepted = int(msg.get("accepted") or 0)
+                        _berrs = msg.get("errors", [])
+                        deleted += int(msg.get("deleted") or 0)
+                        if not _berrs and accepted == len(chunk):
+                            for deleted_key in chunk:
+                                _progress_cache.pop(deleted_key, None)
+                            save_delta_cache(_cache_path, _progress_cache)
+                        else:
+                            errors += max(1, len(chunk) - accepted)
                     else:
                         errors += len(chunk)
                         write_log(f"SYNC_TO_CCD_REG: delete failed ({{del_r.status_code}}): {{del_r.text[:300]}}", "ERROR")
@@ -1608,11 +1886,19 @@ def execute_step(step, prev_result):
                 for i in range(0, len(to_update), batch_size):
                     chunk = to_update[i:i + batch_size]
                     upd_r = request_with_retry(
-                        sess, "POST", f"{{erpnext_url}}/api/method/agent_bulk_sync", "SYNC_TO_CCD_REG",
-                        json={{"action": "update_batch", "doctype": ccd_doctype, "rows": json.dumps(chunk)}}
+                        sess,
+                        "POST",
+                        f"{{erpnext_url}}/api/method/{{AGENT_SYNC_API}}.update_registration_batch",
+                        "SYNC_TO_CCD_REG",
+                        json={{
+                            "registration": registration_id,
+                            "source_id": source_id,
+                            "sync_generation": _authorized_sync_generation,
+                            "rows": json.dumps(chunk, default=str),
+                        }},
                     )
                     if upd_r.status_code == 200:
-                        msg = upd_r.json().get("message", {{}})
+                        msg = _api_message(upd_r)
                         updated += msg.get("updated", len(chunk))
                         _berrs = msg.get("errors", [])
                         errors += len(_berrs)
@@ -2034,6 +2320,18 @@ def execute_step(step, prev_result):
                         errors += len(_berrs)
                         if not _berrs:
                             checkpoint_master_rows(chunk)
+                        elif msg.get("baseline_adoption"):
+                            # The server compared the complete incoming payload
+                            # and explicitly rejected it.  Existing source keys
+                            # are not proof that these values match, so do not
+                            # let the existence-only ambiguous-write recovery
+                            # advance the local cache for this batch.
+                            write_log(
+                                "SYNC_TO_CCD_MASTER_BULK: baseline validation "
+                                "rejected the batch — local Master checkpoint "
+                                "was not advanced",
+                                "WARN",
+                            )
                         else:
                             reconcile_master_rows(chunk)
                         for be in _berrs[:3]:
@@ -2546,6 +2844,7 @@ def execute_step(step, prev_result):
 def execute_pipeline():
     """Run actions sequentially and never advance after a failed action."""
     global _pipeline_step_failed
+    validate_registration_fence()
     result = None
     total = len(actions)
     for idx, step in enumerate(actions, 1):
@@ -2576,6 +2875,9 @@ try:
         try:
             result = execute_pipeline()
             write_log(f"Pipeline completed: {{str(result)[:2000]}}")
+        except RegistrationFenceError as e:
+            write_log(f"Registration fence closed: {{e}}", "WARN")
+            break
         except Exception as e:
             write_log(f"Pipeline error: {{e}}", "ERROR")
         next_run = datetime.now() + timedelta(seconds=interval)
@@ -3356,8 +3658,15 @@ def process_ccd_registration_doc(doc_data, physical_hostname):
                 job_pids[f"{registration_id}:{job_name}"] = pid
         print("=" * 50)
 
+    watchdog_pid = None
     if job_pids:
-        start_watchdog_daemon(job_pids, job_sysVars, mail_config)
+        watchdog_pid = start_watchdog_daemon(job_pids, job_sysVars, mail_config)
+
+    return {
+        "registration": registration_id,
+        "jobs": dict(job_pids),
+        "watchdog": watchdog_pid,
+    }
 
 # Loggers are turned ON so we can watch the upgrade happen.
 sio = socketio.Client(ssl_verify=True, logger=True, engineio_logger=True, reconnection=True, reconnection_attempts=5, reconnection_delay=2)
@@ -3441,6 +3750,7 @@ def handle_ghost(data):
 
 def run_agent():
     """Run the foreground agent and report startup/runtime failures to Windows."""
+    print(f"CCD Agent version: {AGENT_PROGRAM_VERSION}")
     if not login_to_erpnext():
         print("\n❌ ERROR: ERPNext authentication failed.")
         return 1
@@ -3466,16 +3776,53 @@ def run_agent():
         print(f"\n📌 Hostname: {hostname}")
         print(f"📌 Discovering CCD Registration records for physical_hostname={hostname}")
 
-        registration_docs = discover_ccd_registration_docs(hostname)
-        if registration_docs:
-            print(f"\n🚀 Found {len(registration_docs)} CCD Registration record(s) for {hostname}")
-            for registration_doc in registration_docs:
-                process_ccd_registration_doc(registration_doc, hostname)
-        else:
-            print(f"❌ No CCD Registration found for physical_hostname or legacy hostname: {hostname}")
+        launched_registrations = set()
+
+        def discover_and_launch_new_registrations():
+            registration_docs = discover_ccd_registration_docs(hostname)
+            new_docs = [
+                registration_doc
+                for registration_doc in registration_docs
+                if str(registration_doc.get("name") or "") not in launched_registrations
+            ]
+            if new_docs:
+                print(
+                    f"\n🚀 Found {len(new_docs)} new CCD Registration record(s) "
+                    f"for {hostname}"
+                )
+                for registration_doc in new_docs:
+                    result = process_ccd_registration_doc(registration_doc, hostname)
+                    launched_registrations.add(
+                        str(
+                            (result or {}).get("registration")
+                            or registration_doc.get("name")
+                            or ""
+                        )
+                    )
+            elif not registration_docs and not launched_registrations:
+                print(
+                    "❌ No CCD Registration found for physical_hostname or "
+                    f"legacy hostname: {hostname}"
+                )
+
+        discovery_interval = max(
+            15,
+            int(os.environ.get("CCD_AGENT_DISCOVERY_INTERVAL", "60") or 60),
+        )
+        discover_and_launch_new_registrations()
+        next_discovery_at = time.monotonic() + discovery_interval
 
         while sio.connected:
             time.sleep(0.4)
+            if time.monotonic() >= next_discovery_at:
+                try:
+                    discover_and_launch_new_registrations()
+                except Exception as discovery_error:
+                    print(
+                        "⚠️ CCD Registration rediscovery failed; the running "
+                        f"jobs remain unchanged: {discovery_error}"
+                    )
+                next_discovery_at = time.monotonic() + discovery_interval
 
         print("\n❌ ERROR: Socket.IO disconnected after its reconnection attempts were exhausted.")
         return 1

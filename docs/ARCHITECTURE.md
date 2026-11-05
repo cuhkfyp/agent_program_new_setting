@@ -77,14 +77,27 @@ Deletes and updates continue through the existing source-scoped API. The new
 route accelerates the initial/new-row bottleneck without replacing colleague
 logic for those operations.
 
-## CCD Registration retry boundary
+## CCD Registration generation and retry boundary
 
-The existing CCD Registration endpoint can commit successful documents while
+Before each pipeline cycle, V3 requests the active submitted Registration's
+server-derived generation. That generation is a digest of the governed source
+identity and exact Registration document revision. Every staging inspect,
+compare, insert, update, delete, and baseline-confirmation request must carry
+the same generation. A retirement hold, cancellation, amended revision, source
+change, or target mismatch therefore closes the fence before another staging
+batch can commit.
+
+The detached stale job stops permanently on a closed fence. The foreground
+agent continues running and rediscovers newly submitted Registration documents
+for the same physical host every minute, so a valid amended revision can start
+without sharing the stale daemon's authority.
+
+The governed CCD Registration endpoint can commit successful documents while
 returning validation errors for other rows in the same batch. The agent does
-not retry that entire batch blindly. It reads back the affected source keys in
-small groups and checkpoints only rows whose stored mapped values exactly
-match the submitted payload. A missing row or a same-key/different-value row
-remains unresolved and fails the pipeline step.
+not retry that entire batch blindly. It reads back the affected source keys
+through the same generation fence and checkpoints only rows whose stored
+mapped values exactly match the submitted payload. A missing row or a
+same-key/different-value row remains unresolved and fails the pipeline step.
 
 Before the next action is allowed, the agent also obtains a central count for
 the generated CCD-REG DocType. The count must match the number of unique client

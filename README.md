@@ -1,12 +1,14 @@
 # CCD Agent Central Sync
 
-This repository contains an opt-in CCD Master ingestion path for the existing
-database agent. It solves two separate problems without changing the current
-`agent_bulk_sync` Server Script or existing Frappe hooks:
+This repository contains the governed V3 database agent and its opt-in CCD
+Master ingestion path. It solves three related problems while preserving the
+existing Frappe document hooks:
 
 - agents on different computers coordinate through a central Redis lease;
 - new CCD Master rows use one validated SQL bulk insert per batch instead of a
   `Document.insert()` call for every row.
+- every CCD Registration staging request is bound to the exact active submitted
+  Registration revision and its synchronization generation.
 
 Existing registrations remain on `Legacy Document Insert` until a System
 Manager changes that registration to `Fast Bulk Insert`.
@@ -44,6 +46,13 @@ Manager changes that registration to `Fast Bulk Insert`.
   and exact mapped values. Confirmed rows are checkpointed, missing or
   conflicting rows remain errors, and a central row-count check must equal the
   client source count before the CCD Master action may run.
+- V3 validates the active Registration before every pipeline cycle. Cancelled,
+  held, or superseded revisions stop their detached daemons, while the main
+  process rediscovers newly submitted amended revisions every minute.
+- V3 staging no longer writes through the generic `agent_bulk_sync` endpoint.
+  The server installs a default-off transition guard around that legacy route;
+  enable **Require Agent V3 for CCD Registration Staging** only after every
+  client machine has been upgraded.
 - Agent delta detection never physically deletes CCD Master rows. A removed
   source key fails closed as `Reconciliation Required`; governed registration
   cancellation and identity retirement remain the authority for source
@@ -141,10 +150,11 @@ method and are never printed by this version.
 
 ## Compatibility and rollback
 
-Fast mode is per registration. To roll back a source, change **CCD Master Sync
-Mode** to `Legacy Document Insert`; the agent uses the existing Server Script
-route on its next changed run. Disabling **Central Agent Sync** globally also
-returns every registration to legacy compatibility mode.
+Fast mode is per registration. To roll back only the Master insertion strategy,
+change **CCD Master Sync Mode** to `Legacy Document Insert`. V3 staging remains
+generation-fenced in either mode. Do not reinstall V2 after the V3 staging
+fence has been enabled; disable the transition setting first if an emergency
+V2 rollback is explicitly required.
 
 The new server files have unique names and require no `hooks.py` edit. They do
 not import or replace `api_identity_retirement.py`, its cancellation hooks, or

@@ -34,6 +34,9 @@ if doc.get("agent_os") in central_agent_templates:
     doc.agent_installation = central_template_content
 """
 
+LEGACY_AGENT_BULK_SYNC_SCRIPT = "Agent bulk sync"
+AGENT_V3_FENCE_MARKER = "# CCD Agent V3 governed staging fence"
+
 REGISTRATION_VALIDATION_BODY = """physical_hostname = str(doc.get("physical_hostname") or "").strip()
 database_name = str(doc.get("db_database") or "").strip()
 table_name = str(doc.get("ccd_table") or "").strip()
@@ -187,6 +190,17 @@ SETTINGS_FIELDS: list[dict[str, Any]] = [
         "description": "Coordinate agents across different hosts through Redis leases.",
     },
     {
+        "fieldname": "enforce_agent_v3_staging_fence",
+        "fieldtype": "Check",
+        "label": "Require Agent V3 for CCD Registration Staging",
+        "default": "0",
+        "description": (
+            "Transition switch. Leave disabled while any V2 client remains. "
+            "After every client machine is on Agent V3, enable this to reject "
+            "the legacy unfenced CCD-REG write endpoint."
+        ),
+    },
+    {
         "fieldname": "limits_column",
         "fieldtype": "Column Break",
     },
@@ -243,7 +257,62 @@ SETTINGS_FIELDS: list[dict[str, Any]] = [
         "options": "long\ndefault\nshort",
         "default": "long",
     },
+    {
+        "fieldname": "agent_mail_section",
+        "fieldtype": "Section Break",
+        "label": "Agent Failure Email Defaults",
+        "description": (
+            "Default [MAIL] values generated for CCD client agents. Existing "
+            "registration-specific [MAIL] values remain authoritative."
+        ),
+    },
+    {
+        "fieldname": "agent_mail_smtp_server",
+        "fieldtype": "Data",
+        "label": "SMTP Server",
+        "default": "smtp.gmail.com",
+    },
+    {
+        "fieldname": "agent_mail_smtp_port",
+        "fieldtype": "Int",
+        "label": "SMTP Port",
+        "default": "587",
+    },
+    {
+        "fieldname": "agent_mail_smtp_user",
+        "fieldtype": "Data",
+        "label": "SMTP User",
+        "default": "ben.kong@rehabsociety.org.hk",
+    },
+    {
+        "fieldname": "agent_mail_column",
+        "fieldtype": "Column Break",
+    },
+    {
+        "fieldname": "agent_mail_smtp_password",
+        "fieldtype": "Password",
+        "label": "SMTP App Password",
+        "description": "Stored encrypted; initially seeded from the established Ben agent config.",
+    },
+    {
+        "fieldname": "agent_mail_notify_email",
+        "fieldtype": "Data",
+        "label": "Notify Email",
+        "default": "ben.kong@rehabsociety.org.hk",
+    },
 ]
+
+
+LEGACY_AFTER_SUBMIT_SCRIPT = "CCD Registration After Submit V2"
+LEGACY_AFTER_SUBMIT_COMMENT = """# Comment by Ben (2026-10-30):
+# This Server Script is intentionally disabled. It mixed the original staging
+# DocType/workspace workflow with experimental custom-SQL configuration code.
+# The complete original workflow plus guarded custom-SQL, three sync actions,
+# and [MAIL] generation now lives in managed application code:
+# db_connector.ccd_registration_provisioning
+# The prior source remains below and in Version history for audit/reference.
+
+"""
 
 
 def _create_or_upgrade_settings_doctype() -> dict[str, Any]:
@@ -348,10 +417,65 @@ def _custom_fields() -> dict[str, list[dict[str, Any]]]:
                 **common,
             },
             {
+                "fieldname": "agent_retirement_safety_section",
+                "fieldtype": "Section Break",
+                "label": "Governed Retirement Safety",
+                "insert_after": "agent_sync_batch_size",
+                "description": (
+                    "A System Manager must stop the client agent and place a "
+                    "server-side hold before retiring this source."
+                ),
+                **common,
+            },
+            {
+                "fieldname": "agent_retirement_hold",
+                "fieldtype": "Check",
+                "label": "Agent Retirement Hold",
+                "default": "0",
+                "read_only": 1,
+                "insert_after": "agent_retirement_safety_section",
+                "description": (
+                    "Blocks new central-sync leases and agent writes while the "
+                    "governed source-retirement operation is prepared."
+                ),
+                **common,
+            },
+            {
+                "fieldname": "agent_retirement_hold_at",
+                "fieldtype": "Datetime",
+                "label": "Last Retirement Hold At",
+                "read_only": 1,
+                "insert_after": "agent_retirement_hold",
+                **common,
+            },
+            {
+                "fieldname": "agent_retirement_hold_column",
+                "fieldtype": "Column Break",
+                "insert_after": "agent_retirement_hold_at",
+                **common,
+            },
+            {
+                "fieldname": "agent_retirement_hold_by",
+                "fieldtype": "Link",
+                "options": "User",
+                "label": "Last Retirement Hold By",
+                "read_only": 1,
+                "insert_after": "agent_retirement_hold_column",
+                **common,
+            },
+            {
+                "fieldname": "agent_retirement_hold_note",
+                "fieldtype": "Small Text",
+                "label": "Latest Retirement Hold Event",
+                "read_only": 1,
+                "insert_after": "agent_retirement_hold_by",
+                **common,
+            },
+            {
                 "fieldname": "agent_sync_state_section",
                 "fieldtype": "Section Break",
                 "label": "Current State",
-                "insert_after": "agent_sync_batch_size",
+                "insert_after": "agent_retirement_hold_note",
                 **common,
             },
             {
@@ -452,6 +576,74 @@ def _custom_fields() -> dict[str, list[dict[str, Any]]]:
                 "insert_after": "agent_sync_last_result",
                 **common,
             },
+            {
+                "fieldname": "agent_baseline_adoption_section",
+                "fieldtype": "Section Break",
+                "label": "Governed Existing Master Baseline Adoption",
+                "insert_after": "agent_sync_last_error",
+                "description": (
+                    "Manager-authorized, zero-write recovery for an exact existing "
+                    "CCD Master population when the current client cache is missing."
+                ),
+                **common,
+            },
+            {
+                "fieldname": "agent_baseline_adoption_state",
+                "fieldtype": "Select",
+                "label": "Baseline Adoption State",
+                "options": "Not Requested\nAuthorized\nIn Progress\nCompleted\nFailed",
+                "default": "Not Requested",
+                "read_only": 1,
+                "insert_after": "agent_baseline_adoption_section",
+                **common,
+            },
+            {
+                "fieldname": "agent_baseline_adoption_expected_count",
+                "fieldtype": "Int",
+                "label": "Expected Existing Rows",
+                "read_only": 1,
+                "insert_after": "agent_baseline_adoption_state",
+                **common,
+            },
+            {
+                "fieldname": "agent_baseline_staging_progress",
+                "fieldtype": "Int",
+                "label": "Staging Rows Confirmed",
+                "read_only": 1,
+                "insert_after": "agent_baseline_adoption_expected_count",
+                **common,
+            },
+            {
+                "fieldname": "agent_baseline_adoption_progress",
+                "fieldtype": "Int",
+                "label": "Master Rows Confirmed",
+                "read_only": 1,
+                "insert_after": "agent_baseline_staging_progress",
+                **common,
+            },
+            {
+                "fieldname": "agent_baseline_adoption_column",
+                "fieldtype": "Column Break",
+                "insert_after": "agent_baseline_adoption_progress",
+                **common,
+            },
+            {
+                "fieldname": "agent_baseline_adoption_event",
+                "fieldtype": "Small Text",
+                "label": "Latest Baseline Adoption Event",
+                "read_only": 1,
+                "insert_after": "agent_baseline_adoption_column",
+                **common,
+            },
+            {
+                "fieldname": "agent_baseline_adoption_payload",
+                "fieldtype": "Long Text",
+                "label": "Baseline Adoption Authorization Payload",
+                "read_only": 1,
+                "hidden": 1,
+                "insert_after": "agent_baseline_adoption_event",
+                **common,
+            },
         ],
         "CCD Master": [
             {
@@ -471,6 +663,7 @@ def _initialize_defaults() -> None:
     defaults = {
         "enabled": 0,
         "coordination_enabled": 1,
+        "enforce_agent_v3_staging_fence": 0,
         "max_parallel_master_syncs": 2,
         "lease_seconds": 1800,
         "postprocess_lease_seconds": 86400,
@@ -486,6 +679,72 @@ def _initialize_defaults() -> None:
         )
         if is_uninitialized:
             frappe.db.set_single_value(SETTINGS_DOCTYPE, fieldname, value)
+
+
+def _initialize_agent_mail_defaults() -> dict[str, Any]:
+    """Seed encrypted mail defaults from the established live Ben config."""
+    from db_connector.ccd_registration_provisioning import (
+        mail_defaults_from_existing_registration,
+    )
+
+    settings = frappe.get_single(SETTINGS_DOCTYPE)
+    existing_password = str(
+        settings.get_password("agent_mail_smtp_password", raise_exception=False) or ""
+    )
+    legacy = mail_defaults_from_existing_registration()
+    defaults = {
+        "agent_mail_smtp_server": "smtp.gmail.com",
+        "agent_mail_smtp_port": 587,
+        "agent_mail_smtp_user": "ben.kong@rehabsociety.org.hk",
+        "agent_mail_notify_email": "ben.kong@rehabsociety.org.hk",
+    }
+    mapping = {
+        "agent_mail_smtp_server": "SMTP_SERVER",
+        "agent_mail_smtp_port": "SMTP_PORT",
+        "agent_mail_smtp_user": "SMTP_USER",
+        "agent_mail_smtp_password": "SMTP_PASS",
+        "agent_mail_notify_email": "NOTIFY_EMAIL",
+    }
+    changed_fields = []
+    for fieldname, mail_key in mapping.items():
+        current = (
+            existing_password
+            if fieldname == "agent_mail_smtp_password"
+            else settings.get(fieldname)
+        )
+        if current not in (None, "", 0):
+            continue
+        value = legacy.get(mail_key) or defaults.get(fieldname)
+        if value in (None, ""):
+            continue
+        settings.set(fieldname, value)
+        changed_fields.append(fieldname)
+    if changed_fields:
+        settings.save(ignore_permissions=True)
+    return {
+        "updated": bool(changed_fields),
+        "fields": changed_fields,
+        "password_available": bool(
+            existing_password or legacy.get("SMTP_PASS")
+        ),
+    }
+
+
+def _disable_legacy_registration_after_submit() -> dict[str, Any]:
+    """Retain the colleague script for audit while preventing double writes."""
+    if not frappe.db.exists("Server Script", LEGACY_AFTER_SUBMIT_SCRIPT):
+        return {"name": LEGACY_AFTER_SUBMIT_SCRIPT, "found": False, "updated": False}
+    script = frappe.get_doc("Server Script", LEGACY_AFTER_SUBMIT_SCRIPT)
+    changed = False
+    if not str(script.get("script") or "").startswith("# Comment by Ben (2026-10-30):"):
+        script.script = LEGACY_AFTER_SUBMIT_COMMENT + str(script.get("script") or "")
+        changed = True
+    if not script.get("disabled"):
+        script.disabled = 1
+        changed = True
+    if changed:
+        script.save(ignore_permissions=True)
+    return {"name": script.name, "found": True, "updated": changed, "disabled": 1}
 
 
 def _install_agent_templates() -> list[dict[str, Any]]:
@@ -551,6 +810,54 @@ def _install_agent_template_guards() -> list[dict[str, Any]]:
                 server_script.save(ignore_permissions=True)
         results.append({"name": script_name, "created": created, "updated": changed})
     return results
+
+
+def _install_legacy_agent_v3_guard() -> dict[str, Any]:
+    """Place a default-off V3 transition guard in the legacy API script.
+
+    The original script body remains intact. While the setting is disabled this
+    call is a no-op, so existing V2 machines keep working during the rollout.
+    """
+    if not frappe.db.exists("Server Script", LEGACY_AGENT_BULK_SYNC_SCRIPT):
+        return {
+            "name": LEGACY_AGENT_BULK_SYNC_SCRIPT,
+            "found": False,
+            "updated": False,
+        }
+    server_script = frappe.get_doc("Server Script", LEGACY_AGENT_BULK_SYNC_SCRIPT)
+    source = str(server_script.get("script") or "")
+    if AGENT_V3_FENCE_MARKER in source:
+        return {"name": server_script.name, "found": True, "updated": False}
+
+    lines = source.splitlines()
+    assignment_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.strip().startswith("doctype")
+            and 'data.get("doctype"' in line
+        ),
+        None,
+    )
+    if assignment_index is None:
+        frappe.throw(
+            "The Agent bulk sync Server Script has an unknown layout; the V3 "
+            "transition guard was not installed"
+        )
+    indent_prefix = lines[assignment_index][
+        : len(lines[assignment_index]) - len(lines[assignment_index].lstrip())
+    ]
+    guard_lines = [
+        f"{indent_prefix}{AGENT_V3_FENCE_MARKER}",
+        f"{indent_prefix}frappe.call(",
+        f'{indent_prefix}    "db_connector.api_agent_sync.guard_legacy_agent_bulk_sync",',
+        f"{indent_prefix}    doctype=doctype,",
+        f"{indent_prefix})",
+    ]
+    lines[assignment_index + 1 : assignment_index + 1] = guard_lines
+    server_script.script = "\n".join(lines)
+    server_script.save(ignore_permissions=True)
+    return {"name": server_script.name, "found": True, "updated": True}
 
 
 def _install_registration_validation_scripts() -> dict[str, Any]:
@@ -710,20 +1017,23 @@ def _add_indexes() -> list[str]:
     return indexes
 
 
-@frappe.whitelist()
-def install() -> dict[str, Any]:
-    if "System Manager" not in set(frappe.get_roles()):
-        frappe.throw("System Manager role is required", frappe.PermissionError)
+def _apply_setup() -> dict[str, Any]:
     settings = _create_or_upgrade_settings_doctype()
     from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
     create_custom_fields(_custom_fields(), update=True)
     agent_localhost_field = _ensure_agent_localhost_field()
     _initialize_defaults()
+    agent_mail_defaults = _initialize_agent_mail_defaults()
     agent_templates = _install_agent_templates()
     agent_template_guards = _install_agent_template_guards()
+    legacy_agent_v3_guard = _install_legacy_agent_v3_guard()
     registration_validation = _install_registration_validation_scripts()
     refreshed_agent_installations = _refresh_active_agent_installations()
+    legacy_after_submit = _disable_legacy_registration_after_submit()
+    from db_connector.api_agent_sync import repair_inherited_amended_sync_state
+
+    inherited_sync_state_repair = repair_inherited_amended_sync_state()
     indexes = _add_indexes()
     frappe.clear_cache(doctype="CCD Registration")
     frappe.clear_cache(doctype="CCD Master")
@@ -737,10 +1047,26 @@ def install() -> dict[str, Any]:
             "CCD Master-agent_sync_run_id",
         ],
         "agent_localhost_field": agent_localhost_field,
+        "agent_mail_defaults": agent_mail_defaults,
         "agent_templates": agent_templates,
         "agent_template_guards": agent_template_guards,
+        "legacy_agent_v3_guard": legacy_agent_v3_guard,
         "registration_validation": registration_validation,
         "refreshed_agent_installations": refreshed_agent_installations,
+        "legacy_after_submit": legacy_after_submit,
+        "inherited_sync_state_repair": inherited_sync_state_repair,
         "indexes_added": indexes,
         "enabled": bool(frappe.db.get_single_value(SETTINGS_DOCTYPE, "enabled")),
     }
+
+
+@frappe.whitelist()
+def install() -> dict[str, Any]:
+    if "System Manager" not in set(frappe.get_roles()):
+        frappe.throw("System Manager role is required", frappe.PermissionError)
+    return _apply_setup()
+
+
+def after_migrate() -> dict[str, Any]:
+    """Keep registration provisioning metadata consistent after deployment."""
+    return _apply_setup()
