@@ -984,6 +984,19 @@ def get_registration_rows(
         fields=output_fields,
         limit_page_length=len(keys) + 1,
     )
+    returned_keys: set[str] = set()
+    duplicate_keys: set[str] = set()
+    for row in rows:
+        returned_key = str(row.get("ccd_source_key") or "").strip()
+        if returned_key in returned_keys:
+            duplicate_keys.add(returned_key)
+        returned_keys.add(returned_key)
+    if duplicate_keys:
+        frappe.throw(
+            "Governed staging comparison found duplicate source keys: "
+            + ", ".join(sorted(duplicate_keys)[:5]),
+            frappe.ValidationError,
+        )
     return {
         "registration": str(registration),
         "source_id": source,
