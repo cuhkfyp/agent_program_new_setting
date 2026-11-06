@@ -334,6 +334,78 @@ class StaticContracts(unittest.TestCase):
         self.assertIn("verified empty target", registration_sync)
         self.assertIn("automatic clearing is disabled", registration_sync)
 
+    def test_staging_cache_is_scoped_to_exact_registration_generation(self) -> None:
+        script = self._generated_daemon_source()
+        tree = ast.parse(script)
+        scope_validator = next(
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "delta_cache_matches_current_scope"
+        )
+        namespace: dict[str, object] = {
+            "_hashlib": hashlib,
+            "source_id": "stable-source",
+            "registration_id": "registration-amended-2",
+            "_authorized_sync_generation": "new-generation",
+        }
+        exec(
+            compile(
+                ast.Module(body=[scope_validator], type_ignores=[]),
+                "<generated-scope-validator>",
+                "exec",
+            ),
+            namespace,
+        )
+        validator = namespace["delta_cache_matches_current_scope"]
+        current_cache = {
+            "version": 2,
+            "source_id": "stable-source",
+            "registration_id": "registration-amended-2",
+            "sync_generation": "new-generation",
+            "records": {"1": "hash"},
+        }
+        self.assertTrue(validator(current_cache))
+        for stale_field, stale_value in (
+            ("registration_id", "registration-retired-1"),
+            ("sync_generation", "old-generation"),
+            ("source_id", "other-source"),
+            ("version", 1),
+        ):
+            stale_cache = dict(current_cache)
+            stale_cache[stale_field] = stale_value
+            self.assertFalse(validator(stale_cache))
+
+    def test_both_staging_paths_ignore_out_of_scope_cache_before_delta(self) -> None:
+        script = self._generated_daemon_source()
+        bulk_start = script.index(
+            'if step_upper.startswith("SYNC_TO_CCD_REG_BULK"):'
+        )
+        single_start = script.index(
+            'if step_upper.startswith("SYNC_TO_CCD_REG"):', bulk_start
+        )
+        master_start = script.index(
+            'if step_upper.startswith("SYNC_TO_CCD_MASTER_BULK"):',
+            single_start,
+        )
+        for staging_path in (
+            script[bulk_start:single_start],
+            script[single_start:master_start],
+        ):
+            scope_check = staging_path.index(
+                "delta_cache_matches_current_scope(_cache_state)"
+            )
+            ignore_cache = staging_path.index(
+                "None\n                if _cache_scope_mismatch"
+            )
+            target_inspection = staging_path.index(
+                "inspect_registration_target_state("
+            )
+            delta_calculation = staging_path.index("to_insert = [")
+            self.assertLess(scope_check, ignore_cache)
+            self.assertLess(ignore_cache, target_inspection)
+            self.assertLess(target_inspection, delta_calculation)
+
     def test_registration_target_inspection_detects_empty_and_populated(self) -> None:
         script = self._generated_daemon_source()
         tree = ast.parse(script)
@@ -469,7 +541,7 @@ class StaticContracts(unittest.TestCase):
         source = AGENT.read_text(encoding="utf-8")
         script = self._generated_daemon_source()
         self.assertIn(
-            'AGENT_PROGRAM_VERSION = "2026.11.05-governed-staging-v3"',
+            'AGENT_PROGRAM_VERSION = "2026.11.06-governed-staging-v3.1"',
             source,
         )
         self.assertIn("validate_registration_fence()", script)
@@ -500,7 +572,11 @@ class StaticContracts(unittest.TestCase):
         source = AGENT.read_text(encoding="utf-8")
         self.assertIn('"version": 2', source)
         self.assertIn('"registration_id": registration_id', source)
-        self.assertIn('"sync_generation": _hashlib.sha256', source)
+        self.assertIn('"sync_generation": cache_generation', source)
+        self.assertIn(
+            "_authorized_sync_generation or _hashlib.sha256",
+            source,
+        )
         self.assertIn("_cache_scope_mismatch", source)
 
     def test_no_hardcoded_erp_endpoint_or_password(self) -> None:

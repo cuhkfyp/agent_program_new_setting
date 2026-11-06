@@ -15,7 +15,7 @@ from urllib.parse import quote as urlquote, urlsplit, urlunsplit
 import socketio
 import urllib3
 
-AGENT_PROGRAM_VERSION = "2026.11.05-governed-staging-v3"
+AGENT_PROGRAM_VERSION = "2026.11.06-governed-staging-v3.1"
 
 import truststore
 truststore.inject_into_ssl()
@@ -840,20 +840,36 @@ def load_delta_cache(cache_path):
     state = load_delta_cache_state(cache_path)
     return state.get("records") if state else None
 
+def delta_cache_matches_current_scope(cache_state):
+    """Return whether one cache belongs to this exact Registration generation."""
+    if not isinstance(cache_state, dict) or cache_state.get("version") != 2:
+        return False
+    generation_material = f"{{source_id}}\x1f{{registration_id}}"
+    expected_generation = _authorized_sync_generation or _hashlib.sha256(
+        generation_material.encode("utf-8")
+    ).hexdigest()
+    return (
+        str(cache_state.get("source_id") or "") == source_id
+        and str(cache_state.get("registration_id") or "") == registration_id
+        and str(cache_state.get("sync_generation") or "")
+        == expected_generation
+    )
+
 def save_delta_cache(cache_path, records_dict):
     """Save delta cache {{ccd_source_key: hash}} to file."""
     temp_path = cache_path + ".tmp"
     try:
         os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
         generation_material = f"{{source_id}}\x1f{{registration_id}}"
+        cache_generation = _authorized_sync_generation or _hashlib.sha256(
+            generation_material.encode("utf-8")
+        ).hexdigest()
         data = {{
             "version": 2,
             "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "source_id": source_id,
             "registration_id": registration_id,
-            "sync_generation": _hashlib.sha256(
-                generation_material.encode("utf-8")
-            ).hexdigest(),
+            "sync_generation": cache_generation,
             "records": records_dict,
         }}
         with open(temp_path, "w", encoding="utf-8") as f:
@@ -1211,7 +1227,23 @@ def execute_step(step, prev_result):
                 return prev_result
 
             _cache_path = os.path.join(os.path.dirname(log_file), f"{{source_id}}_CCD-REG_delta_cache.json")
-            _cache = load_delta_cache(_cache_path)
+            _cache_state = load_delta_cache_state(_cache_path)
+            _cache_scope_mismatch = bool(
+                _cache_state
+                and not delta_cache_matches_current_scope(_cache_state)
+            )
+            _cache = (
+                None
+                if _cache_scope_mismatch
+                else (_cache_state.get("records") if _cache_state else None)
+            )
+            if _cache_scope_mismatch:
+                write_log(
+                    "SYNC_TO_CCD_REG_BULK: prior staging cache belongs to "
+                    "another Registration generation and will be ignored; "
+                    "the governed target will be inspected before any write",
+                    "WARN",
+                )
             _progress_cache = dict(_cache or {{}})
             _progress_ready = _cache is not None
             batch_size = 100
@@ -1756,7 +1788,23 @@ def execute_step(step, prev_result):
                 client_map[_key] = (_hash, _cleaned)
 
             _cache_path = os.path.join(os.path.dirname(log_file), f"{{source_id}}_CCD-REG_delta_cache.json")
-            _cache = load_delta_cache(_cache_path)
+            _cache_state = load_delta_cache_state(_cache_path)
+            _cache_scope_mismatch = bool(
+                _cache_state
+                and not delta_cache_matches_current_scope(_cache_state)
+            )
+            _cache = (
+                None
+                if _cache_scope_mismatch
+                else (_cache_state.get("records") if _cache_state else None)
+            )
+            if _cache_scope_mismatch:
+                write_log(
+                    "SYNC_TO_CCD_REG: prior staging cache belongs to another "
+                    "Registration generation and will be ignored; the governed "
+                    "target will be inspected before any write",
+                    "WARN",
+                )
             _progress_cache = dict(_cache or {{}})
             _progress_ready = _cache is not None
             batch_size = 100
